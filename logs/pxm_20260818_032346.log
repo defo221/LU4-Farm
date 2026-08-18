@@ -1,0 +1,3 @@
+2026/08/18 03:23:46 | INFO | [HID] auto-detected COM6 (Arduino Micro (COM6))
+2026/08/18 03:23:48 | WARN | [HID] COM6 answered PING='1' STEP_SIZE='' - this board needs the updated mouse.ino. Clicks and scroll will work; drag-pan and keystrokes will not.
+2026/08/18 03:23:48 | INFO | [NET] LOOP listening on 0.0.0.0:8772

@@ -1,0 +1,15 @@
+{
+  "_comment": "Fleet layout for stream_viewer.py. 'grid' is [cols, rows]; slaves fill it left-to-right, top-to-bottom, and that order is what the 1-9 selection keys follow. Port 8772 matches stream_sender's default and sits clear of 8770 (PXM_RB coordinator), 8081 (PXM_LU4 update server) and 8000 (PXM_RB file server). Replace the host addresses below with each slave's real IP.",
+  "grid": [3, 3],
+  "slaves": [
+    { "name": "PC1", "host": "192.168.0.119", "port": 8772 },
+    { "name": "PC2", "host": "192.168.0.12", "port": 8772 },
+    { "name": "PC3", "host": "192.168.0.13", "port": 8772 },
+    { "name": "PC4", "host": "192.168.0.14", "port": 8772 },
+    { "name": "PC5", "host": "192.168.0.15", "port": 8772 },
+    { "name": "PC6", "host": "192.168.0.16", "port": 8772 },
+    { "name": "PC7", "host": "192.168.0.17", "port": 8772 },
+    { "name": "PC8", "host": "192.168.0.18", "port": 8772 },
+    { "name": "PC9", "host": "192.168.0.19", "port": 8772 }
+  ]
+}

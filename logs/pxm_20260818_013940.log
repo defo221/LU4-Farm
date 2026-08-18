@@ -1,0 +1,8 @@
+2026/08/18 01:39:40 | ERROR | [HID] open COM_NOPE failed: could not open port 'COM_NOPE': FileNotFoundError(2, 'Не удается найти указанный файл.', None, 2)
+2026/08/18 01:39:40 | WARN | [HID] running view-only: no Arduino, and no fallback exists
+2026/08/18 01:39:40 | INFO | [NET] LOOP-A listening on 0.0.0.0:5599
+2026/08/18 01:39:40 | ERROR | [HID] open COM_NOPE failed: could not open port 'COM_NOPE': FileNotFoundError(2, 'Не удается найти указанный файл.', None, 2)
+2026/08/18 01:39:40 | WARN | [HID] running view-only: no Arduino, and no fallback exists
+2026/08/18 01:39:40 | INFO | [NET] LOOP-B listening on 0.0.0.0:5600
+2026/08/18 01:39:48 | INFO | [NET] viewer connected from 127.0.0.1:51569
+2026/08/18 01:39:48 | INFO | [NET] viewer connected from 127.0.0.1:51570

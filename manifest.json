@@ -1,0 +1,232 @@
+{
+  "bot.py": {
+    "sha256": "e39905172acd5b034ffd6fe4d0257b290bb8158acd7aeb19258885ff22348624",
+    "size": 88644
+  },
+  "hotkey_assist.py": {
+    "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
+    "size": 20400
+  },
+  "arduino_hid.py": {
+    "sha256": "5e89bb3f85958f143f3e47a751ce0d204f8c3cf9c686988fccd4d6c710ac9ee1",
+    "size": 11695
+  },
+  "vision.py": {
+    "sha256": "0f76aa6a3688babca22319086000235dd036a6f1c7b13fa54781d667b8843df5",
+    "size": 5539
+  },
+  "window_manager.py": {
+    "sha256": "f87f7449020e510132013f056a5c78c20e4e43c5c69f72c80123bab605b06429",
+    "size": 10555
+  },
+  "logger.py": {
+    "sha256": "49dbc0a9e4be51a45a9c5d815ead22cbc46439400bf04e607f6b769933473f8c",
+    "size": 4576
+  },
+  "notifier.py": {
+    "sha256": "ace95de2e7fa0392585a618a70e71d1876b72278ff9a72b26f47105a8798a816",
+    "size": 5777
+  },
+  "capslock.py": {
+    "sha256": "1a3d81939ccb2a24c4e13397732141d3c69ace93dd1649f384e5678933e52228",
+    "size": 2483
+  },
+  "hp_monitor.py": {
+    "sha256": "301878d96ce229814f6f0052a62aa1dc222f130bbb4eadadd95144b1ff4f7b84",
+    "size": 8801
+  },
+  "input_recorder.py": {
+    "sha256": "740080848346d2466f14676a061f2f20ccbd12146826ad211c1e784872845188",
+    "size": 11663
+  },
+  "rmb_anchor_timer.py": {
+    "sha256": "6161c62b2ea14772b7ee2c59e82b680d01dfdbc3bc9b357d7f0827ea65392b5f",
+    "size": 12247
+  },
+  "debug_templates.py": {
+    "sha256": "355f7d6f2225e9974660de66c27f242e8dc260ad83cf0465f91192f60c784130",
+    "size": 1252
+  },
+  "run_bot.bat": {
+    "sha256": "b962e4aac3ce9e4a95a5a9fb1bad8018be3ea303f775b3b24a1753c6b7432033",
+    "size": 329
+  },
+  "run_hotkey_assist.bat": {
+    "sha256": "14fa74507498b2a79d2ab5ee13f59bd2fd133b88b98573e994e0a581a5225d77",
+    "size": 378
+  },
+  "run_hp_monitor.bat": {
+    "sha256": "d17aa713cf75264cfd031f8514962d3eb159bb0ab695c237bdbed15312f4b298",
+    "size": 374
+  },
+  "run_recorder.bat": {
+    "sha256": "c58720720f5761455974eff644cd04f6dfd484cd86e668eafbf0e9e17992c827",
+    "size": 59
+  },
+  "run_rmb_timer.bat": {
+    "sha256": "214f072590476b0b459fd758a53645f1d16d4d13817af57a556e7e4dcbb74778",
+    "size": 175
+  },
+  "updater.py": {
+    "sha256": "44654c755254701e7bafba46ca0e5cdc690467685c6c873a796223a559b6af29",
+    "size": 19295
+  },
+  "make_manifest.bat": {
+    "sha256": "ed9bfc75cacabba73e1a64e5e7dc8e77e8e8bfb56f662981588d4b8ee696579f",
+    "size": 197
+  },
+  "run_updater.bat": {
+    "sha256": "238a651d852a99d408a4754c50c00eb7401523676ff9b1fdfdf5cf9acb20a319",
+    "size": 414
+  },
+  "start_fileserver.bat": {
+    "sha256": "928f65c16515a0a9ad65593cab41339a5ce2da072554895e0337e3046ac84b2c",
+    "size": 929
+  },
+  "fileserver.py": {
+    "sha256": "c8959aef99b7d14c3a2b07715b33b1cd864fd50fadc592cfbfb790b65a83fbf2",
+    "size": 8602
+  },
+  "stream_proto.py": {
+    "sha256": "cffa43e90774aa7864926f8ca6f3e6724287de2d7b51ebb8f479337e90a56f42",
+    "size": 8230
+  },
+  "stream_sender.py": {
+    "sha256": "9e3fdf2b9e92e66ca1d2ced91e62bdd01e9919b4b81b75f332154064d119df3e",
+    "size": 28687
+  },
+  "stream_viewer.py": {
+    "sha256": "7c70e41b019c738e7cb55890395c7569e389194358d78cf31c9378c33e8ea684",
+    "size": 31060
+  },
+  "run_stream_sender.bat": {
+    "sha256": "56ce0e3b6536baa5b8ef7fc083c7c2c391b9dcebf76aede39ae3d5fa9f235ad4",
+    "size": 957
+  },
+  "run_stream_viewer.bat": {
+    "sha256": "85d036637abf4cabe5eac183806aae7db298abe18800c941e0fcc304c1e0878b",
+    "size": 285
+  },
+  "setup_slave_firewall.bat": {
+    "sha256": "976823bde662685225af094f9e51ea154de6cc73122494990661895d552ff940",
+    "size": 2650
+  },
+  "mouse.ino": {
+    "sha256": "fb4b76d7aaf97fef3975952542bb67cd8e0061c5a1c3d995767a1d3e2b5be4f0",
+    "size": 14408
+  },
+  "l2cursor.cur": {
+    "sha256": "54cb10aff82f637f159577a3c37c5e658dc1f4d03ca441f9ef12a2d726810735",
+    "size": 2238
+  },
+  "assets/asus/bag_mob_anchor.png": {
+    "sha256": "258d7b4b4ec7e8357f4fe0b7828c333311204ba1d5c6e1be1069bb7e5b3f2440",
+    "size": 858
+  },
+  "assets/asus/char_bars_anchor.png": {
+    "sha256": "da949a3c7af25602fafb1cc05ec5d4c619798ce81d78da6751e85d5c2c1a6377",
+    "size": 599
+  },
+  "assets/asus/mob_dead.png": {
+    "sha256": "44978b2814076b1d5770135a7798882bcfb49c73a65514aaa75faadea7b71ca0",
+    "size": 3302
+  },
+  "assets/asus/party_pl_anchor.png": {
+    "sha256": "cefa619189d1c8929c197b8217562ca8e33a452dc1186b405bc1a4353c243468",
+    "size": 2629
+  },
+  "assets/bag_mob_anchor.png": {
+    "sha256": "d08ee591e3dc58b611142df84e0db3043fab8cb2c2d54c75d6b102f2c9111ca2",
+    "size": 1132
+  },
+  "assets/char_bars_anchor.png": {
+    "sha256": "84a18c01e7b855e6a0cd9cb8febcd4b9aba104c41b02bfbeffd42d01296d584c",
+    "size": 721
+  },
+  "assets/death_screen.png": {
+    "sha256": "780ae285ce12217b81ab2009fa618d701deaf24998748200cc9c7384623c943d",
+    "size": 2058
+  },
+  "assets/full_buff_check.png": {
+    "sha256": "867a28ea0f7be411e033cb705124c73c002ddf331cfb64d6e600967446268d1c",
+    "size": 1932
+  },
+  "assets/full_buff_check1.png": {
+    "sha256": "5c802a3759eff220dc408cb698826624db5e040919d042fe7517dcd49b0da60d",
+    "size": 3508
+  },
+  "assets/fullhd/bag_mob_anchor.png": {
+    "sha256": "d9fc418ca6d5271672f92444103d241a21beec7d7868662651ea9d7a4e529842",
+    "size": 895
+  },
+  "assets/fullhd/char_bars_anchor.png": {
+    "sha256": "104c8059f8325fa49aecdb9c80dbbf81efe9e47539e826a161b765d8df8c72c8",
+    "size": 520
+  },
+  "assets/fullhd/death_screen.png": {
+    "sha256": "780ae285ce12217b81ab2009fa618d701deaf24998748200cc9c7384623c943d",
+    "size": 2058
+  },
+  "assets/fullhd/mob_dead.png": {
+    "sha256": "1acad251d7a946bb5dcc8709e7f2a898b8c364c351785642c4551984d66e5d56",
+    "size": 4537
+  },
+  "assets/fullhd/party_pl_anchor.png": {
+    "sha256": "db2ac25c17825d1905c667975cbf53eb59128cb80e5a76f4c168766956b26cd0",
+    "size": 468
+  },
+  "assets/fullhd_small/bag_mob_anchor.png": {
+    "sha256": "1bfecb9d9b18404d17aeb1413a6410be660aa1afc57cd0a7b62a7b141014d750",
+    "size": 848
+  },
+  "assets/fullhd_small/char_bars_anchor.png": {
+    "sha256": "f62dc00ca4bbbc6675447e47f77045642a0334a309ef6cb4b1026d3269f21914",
+    "size": 520
+  },
+  "assets/fullhd_small/char_target_anchor.png": {
+    "sha256": "91066f0e3cb284a3cd1aab7bd4094ecec1848a91931af78958b4ffc76949a3a1",
+    "size": 1217
+  },
+  "assets/in_target_blue.png": {
+    "sha256": "da92526fd87b27897d6521c695f7f57f5d627424eae79df45faf0d8caa70db81",
+    "size": 652
+  },
+  "assets/in_target_red.png": {
+    "sha256": "2879d1c186b1005586c13b2491583f8f81a9330379f210da95a41b18dcd44ba6",
+    "size": 653
+  },
+  "assets/mob_dead.png": {
+    "sha256": "869173737e9732086814e0dc2911210f1d1ad5fa2490525aab0ab23af0f91a6d",
+    "size": 4743
+  },
+  "assets/mob_name1.png": {
+    "sha256": "368ac8bdb8bede1d244e76275a1e6a50083af056e1f50ce122c599df64894d53",
+    "size": 1347
+  },
+  "assets/mob_skip.png": {
+    "sha256": "4ec6cf5ef05fa018b42c6ca645db4014d9a14523779c00252d70ccd7f425da59",
+    "size": 8907
+  },
+  "assets/mob_skip1.png": {
+    "sha256": "9c9147d8c66956088b3cce9102175b23e573b72b244f6ced2d290e1dc394d3e1",
+    "size": 9500
+  },
+  "assets/mob_skip2.png": {
+    "sha256": "34c07741b967e1e97da2c3cf1448cab8fe4428e624cf2b302cad29f0cd1804c9",
+    "size": 1081
+  },
+  "assets/mob_skip3.png": {
+    "sha256": "f19d0fdc780a0bb098a98b6d2efa58ac2dd965f65ec71d5845806a8ef40d2df0",
+    "size": 9280
+  },
+  "assets/party_pl_anchor.png": {
+    "sha256": "db2ac25c17825d1905c667975cbf53eb59128cb80e5a76f4c168766956b26cd0",
+    "size": 468
+  },
+  "config.py": {
+    "sha256": "734bfa897383ff4d50224f2f61da9cfe97c58dc88118465fa993688d7b8e84b9",
+    "shared_sha256": "a96275517975a7ac984434f9259f56b71682cc73ab25842da635378b4d152a5c",
+    "size": 14989,
+    "partial_update": true
+  }
+}

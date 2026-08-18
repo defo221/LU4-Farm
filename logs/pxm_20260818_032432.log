@@ -1,0 +1,5 @@
+2026/08/18 03:24:32 | INFO | [HID] auto-detected COM6 (Arduino Micro (COM6))
+2026/08/18 03:24:34 | INFO | [HID] connected COM6, step size 40px
+2026/08/18 03:24:34 | INFO | [NET] LOOP listening on 0.0.0.0:8772
+2026/08/18 03:25:06 | INFO | [NET] viewer connected from 127.0.0.1:26508
+2026/08/18 03:25:37 | INFO | [NET] viewer connected from 127.0.0.1:26526
