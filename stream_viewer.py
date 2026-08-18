@@ -19,14 +19,17 @@ That holds at any tile scale, and stays correct even if the sender changes its
 downscale factor while frames are in flight.
 
 Controls
-    left click            first click selects a tile, later clicks are sent to it
+    hover                 activates a tile immediately; no click required to select
+    left click            send a click to the active slave
+    middle click          toggle max-FPS lock on that tile (blue border stays, never forwarded)
     right drag            camera pan (press, hold, move, release)
     wheel                 scroll
-    Tab / Shift-Tab       cycle selection
-    1-9                   select tile N
-    Z                     zoom the selected tile to fill the window
-    Ctrl-K                arm/disarm keyboard passthrough to the selected slave
-    Escape                disarm passthrough and release everything held
+    Ctrl+Tab              cycle to the next tile
+    Ctrl+Shift+Tab        cycle to the previous tile
+    Alt+1…Alt+0           jump directly to tile 1–10 (0 = tenth)
+    ` (backtick)          zoom the active tile to fill the window
+    +/-                   raise/lower the active tile frame rate
+    other keys            sent to the active tile, including Escape
 """
 
 import argparse
@@ -104,7 +107,7 @@ _CURSOR_DATA = _load_cur(_CUR_PATH)   # (rgba, hx, hy) or None
 
 # ── tuning ────────────────────────────────────────────────────────────────────
 IDLE_FPS = 5.0                 # tiles you are not touching
-ACTIVE_FPS = 25.0              # the selected tile; +/- retunes this live
+ACTIVE_FPS = 18.0              # the selected tile; +/- retunes this live
 FPS_LIMITS = (1.0, 30.0)
 UI_HZ = 30                     # redraw rate
 PAN_SEND_HZ = 25               # cap on moverel messages while right-dragging
@@ -137,14 +140,33 @@ KEYSYM_MAP.update({f"F{i}": f"f{i}" for i in range(1, 13)})
 
 
 def keysym_to_name(event):
-    """Translate a Tk key event into a firmware key name, or None."""
+    """Translate a Tk key event into a firmware key name, or None.
+
+    Letter and digit keys are resolved by physical scan code (Windows VK code
+    stored in event.keycode), not by the character the current layout produces.
+    This matches how games handle input: pressing the key labelled W always
+    sends 'w' regardless of whether the active layout is English, Russian, etc.
+
+    VK_A=65..VK_Z=90 are always the 26 QWERTY letter positions.
+    VK_0=48..VK_9=57 are always the ten digit positions on the main row.
+
+    Special keys (arrows, F1-F12, Tab, …) use the keysym table and are already
+    layout-independent in Tk.  Punctuation falls back to the character produced
+    by the layout, since OEM VK codes differ across keyboard hardware.
+    """
     ks = event.keysym
     if ks in KEYSYM_MAP:
         return KEYSYM_MAP[ks]
-    if len(ks) == 1:
+    kc = event.keycode                # Windows VK code (layout-independent)
+    if 65 <= kc <= 90:                # VK_A..VK_Z → 'a'..'z'
+        return chr(kc + 32)
+    if 48 <= kc <= 57:                # VK_0..VK_9 → '0'..'9'
+        return chr(kc)
+    # Punctuation fallback: use whatever the layout produces.
+    if len(ks) == 1 and ks.isprintable():
         return ks.lower()
     ch = event.char
-    if len(ch) == 1 and ch.isprintable():
+    if ch and len(ch) == 1 and ch.isprintable():
         return ch.lower()
     return None
 
@@ -177,6 +199,7 @@ class SlaveLink:
         self.dropped = 0          # frames/sec the sender skipped to stay paced
         self.unchanged = 0        # frames/sec skipped because the screen was still
         self.capture = ""         # slave's capture backend: dxcam | mss
+        self.lang = ""            # slave's current keyboard layout: "EN", "RU", …
 
         # what the sender should produce; resent whenever the layout changes
         self.want_scale = 0.34
@@ -258,6 +281,9 @@ class SlaveLink:
             self.dropped = int(obj.get("drop", 0))
             self.unchanged = int(obj.get("same", 0))
             self.capture = str(obj.get("cap", self.capture))
+            v = obj.get("lang", "")
+            if v:
+                self.lang = str(v)
         elif t == "error":
             self.note = obj.get("msg", "")
 
@@ -335,6 +361,7 @@ class Tile:
         self.img_id = None
         self.text_id = None
         self.border_id = None
+        self.fps_locked = False           # MMB-locked to active FPS regardless of hover
 
     def canvas_to_slave(self, cx, cy):
         """Map a canvas point to slave-absolute pixels, or None if outside."""
@@ -363,12 +390,13 @@ class Viewer:
 
         self.selected = None          # index into self.tiles
         self.zoomed = False
-        self.passthrough = False
         self.held_keys = set()
         self.active_fps = ACTIVE_FPS
 
         self._pan = None              # active right-drag state
         self._layout_key = None
+        self._alt_held = False        # Alt is down on the viewer keyboard
+        self._alt_combo = False       # this Alt hold was used as Alt+digit
 
         root.title("PXM fleet viewer")
         root.configure(bg="#101010")
@@ -406,6 +434,7 @@ class Viewer:
     def _bind(self):
         c = self.canvas
         c.bind("<Button-1>", self._on_left_down)
+        c.bind("<Button-2>", self._on_middle_down)
         c.bind("<Button-3>", self._on_right_down)
         c.bind("<B3-Motion>", self._on_right_motion)
         c.bind("<ButtonRelease-3>", self._on_right_up)
@@ -415,6 +444,20 @@ class Viewer:
 
         self.root.bind("<KeyPress>", self._on_key_down)
         self.root.bind("<KeyRelease>", self._on_key_up)
+        # Dedicated Alt_L/Alt_R bindings are MORE SPECIFIC than <KeyPress>, so
+        # Tkinter dispatches them first and returns "break" before Windows' own
+        # system-menu hook can consume the key.  This is the primary fix for
+        # Alt+digit combos missing on the first attempt.
+        self.root.bind("<Alt_L>", self._on_alt_down)
+        self.root.bind("<Alt_R>", self._on_alt_down)
+        # Explicit Alt+digit bindings so they are captured even when Tkinter's
+        # window-menu system would otherwise swallow the Alt prefix on Windows.
+        for d in "0123456789":
+            self.root.bind(f"<Alt-Key-{d}>",
+                           lambda e, k=d: self._on_alt_digit(k))
+        # Re-claim keyboard focus whenever the mouse enters the canvas so that
+        # hotkeys work immediately after hovering in from another application.
+        c.bind("<Enter>", lambda e: self.canvas.focus_set())
         self.canvas.focus_set()
 
     # ---- layout ----
@@ -467,7 +510,7 @@ class Viewer:
                 continue
 
             selected = (i == self.selected)
-            colour = "#3fa7ff" if selected else "#303030"
+            colour = "#3fa7ff" if (selected or t.fps_locked) else "#303030"
             if t.border_id is None:
                 t.border_id = self.canvas.create_rectangle(0, 0, 0, 0, width=TILE_BORDER)
             self.canvas.coords(t.border_id, bx + 1, by + 1, bx + bw - 1, by + bh - 1)
@@ -532,19 +575,19 @@ class Viewer:
                 bits.append(f"{link.build_ms:.0f}ms {core:.0f}%core")
             if link.dropped:
                 bits.append(f"-{link.dropped}/s")
-            if link.unchanged:
-                # Explains a low fps: the screen was still, so those frames
-                # were never encoded rather than lost.
-                bits.append(f"={link.unchanged}/s")
+            if link.lang:
+                bits.append(f"[{link.lang}]")
             if link.capture == "mss":
                 bits.append("SLOW CAPTURE (pip install dxcam)")
             if not link.arduino:
                 bits.append("NO ARDUINO")
+        if t.fps_locked:
+            bits.append("[MAX]")
         if link.note:
             bits.append(link.note[:60])
         text = "  ".join(bits)
         fg = {"online": "#8fdc8f", "connecting": "#d8c46a"}.get(link.status, "#c56b6b")
-        if selected:
+        if selected or t.fps_locked:
             fg = "#8fd0ff"
         if t.text_id is None:
             t.text_id = self.canvas.create_text(0, 0, anchor="nw",
@@ -554,6 +597,11 @@ class Viewer:
 
     # ---- viewer cursor (L2 art, follows viewer mouse) ----
     def _on_mouse_move(self, event):
+        # Hover-to-select: entering a tile activates it immediately.
+        idx = self._tile_at(event.x, event.y)
+        if idx is not None and idx != self.selected:
+            self._select(idx)
+
         if self._cur_id is None:
             return
         self.canvas.coords(self._cur_id,
@@ -568,14 +616,13 @@ class Viewer:
 
     def _update_status(self):
         sel = "none" if self.selected is None else self.tiles[self.selected].link.name
-        kb = "ARMED" if self.passthrough else "off"
         online = sum(1 for t in self.tiles if t.link.status == "online")
         self.status.configure(
-            text=f" selected: {sel}   keyboard: {kb}   online: {online}/{len(self.tiles)}"
+            text=f" active: {sel}   online: {online}/{len(self.tiles)}"
                  f"   asking {self.active_fps:.0f}fps"
-                 f"   |  click=select then click   right-drag=pan   wheel=scroll"
-                 f"   Tab=next  1-9=pick  Z=zoom  +/-=fps  Ctrl+K=keyboard  Esc=release",
-            fg="#ffd479" if self.passthrough else "#d0d0d0")
+                 f"   |  hover=select  click=action  right-drag=pan  wheel=scroll"
+                 f"   Ctrl+Tab=next  Ctrl+Shift+Tab=prev  Alt+1-0=pick"
+                 f"   Z=zoom  +/-=fps")
 
     # ---- hit testing ----
     def _tile_at(self, cx, cy):
@@ -589,9 +636,11 @@ class Viewer:
         if idx == self.selected:
             return
         if self.selected is not None:
-            old = self.tiles[self.selected].link
-            self._release_keys(old)
-            old.set_active(False)
+            old_tile = self.tiles[self.selected]
+            self._release_keys(old_tile.link)
+            # Keep locked tiles at active FPS even when deselected.
+            if not old_tile.fps_locked:
+                old_tile.link.set_active(False)
         self.selected = idx
         if idx is not None:
             self.tiles[idx].link.set_active(True, self.active_fps)
@@ -612,6 +661,23 @@ class Viewer:
         if pos is None:
             return
         t.link.send({"t": "click", "x": pos[0], "y": pos[1], "btn": "left"})
+
+    def _on_middle_down(self, event):
+        """Toggle per-tile max-FPS lock.  Never forwarded to the slave."""
+        idx = self._tile_at(event.x, event.y)
+        if idx is None:
+            return "break"
+        t = self.tiles[idx]
+        t.fps_locked = not t.fps_locked
+        if t.fps_locked:
+            # Immediately run at active FPS regardless of whether it is selected.
+            t.link.set_active(True, self.active_fps)
+        elif idx != self.selected:
+            # Unlocked and not the hovered tile → drop back to idle.
+            t.link.set_active(False)
+        # If unlocked but still selected, hover-based logic keeps it active.
+        self._layout_key = None        # force border colour refresh
+        return "break"
 
     def _on_right_down(self, event):
         idx = self._tile_at(event.x, event.y)
@@ -692,54 +758,140 @@ class Viewer:
         t.link.send({"t": "scroll", "steps": steps, "x": pos[0], "y": pos[1]})
 
     # ---- keyboard ----
+    def _alt_down(self, event=None):
+        """True if Alt is held, even when Tk omits the modifier bit on the digit."""
+        if self._alt_held:
+            return True
+        if event is not None and event.state & 0x20008:
+            return True
+        return False
+
+    def _pick_tile_by_digit(self, digit):
+        """Alt+1…Alt+0: switch tile. Never send the combo to the slave.
+
+        Called even when that tile is already selected, so a repeat Alt+2 stays
+        fully swallowed instead of leaking '2' (or a leftover Alt) into the game.
+        """
+        self._alt_combo = True
+        # If Alt already went out (a previous non-digit key flushed it), lift
+        # it so the slave cannot see Alt+digit together.
+        self._unsend_keys(("alt", "ralt"))
+        n = (int(digit) - 1) % 10
+        if n < len(self.tiles):
+            self._select(n)
+
+    def _unsend_keys(self, names):
+        link = self._selected_link()
+        for name in names:
+            if name not in self.held_keys:
+                continue
+            self.held_keys.discard(name)
+            if link is not None:
+                link.send({"t": "kup", "key": name})
+
+    def _flush_alt_to_slave(self):
+        """Send the deferred Alt-down so in-game Alt+other-key still works."""
+        if "alt" in self.held_keys:
+            return
+        link = self._selected_link()
+        if link is None:
+            return
+        self.held_keys.add("alt")
+        link.send({"t": "kdown", "key": "alt"})
+
+    def _on_alt_down(self, event):
+        """Dedicated Alt_L / Alt_R handler.
+
+        Binding <Alt_L> directly is more specific than <KeyPress>, so Tkinter
+        dispatches it first and the "break" return prevents Windows' system-menu
+        hook from consuming the key — which was the root cause of Alt+digit
+        combos missing on fast presses.
+        """
+        self._alt_held = True
+        if bool(event.state & 0x1):          # Shift already held → layout switch
+            self._flush_alt_to_slave()
+        return "break"
+
     def _on_key_down(self, event):
-        ctrl = bool(event.state & 0x4)
+        ctrl  = bool(event.state & 0x4)
+        shift = bool(event.state & 0x1)
+        ks    = event.keysym
 
-        if ctrl and event.keysym.lower() == "k":
-            self._toggle_passthrough()
-            return "break"
-        if event.keysym == "Escape":
-            self._panic()
-            return "break"
+        # ── Always-intercepted viewer controls ───────────────────────────────
+        # Escape is not one of them: it goes to the game like any other key.
+        # Alt_L / Alt_R are handled by the dedicated _on_alt_down binding above
+        # (more specific → fires before this handler → "break" already returned).
+        # If for any reason that binding is missed, handle it here as a fallback.
+        if ks in ("Alt_L", "Alt_R"):
+            return self._on_alt_down(event)
 
-        if not self.passthrough:
-            ks = event.keysym
-            if ks == "Tab":
-                self._cycle(1)
-                return "break"
-            if ks == "ISO_Left_Tab":
-                self._cycle(-1)
-                return "break"
-            if ks.lower() == "z":
-                self.zoomed = not self.zoomed
-                self._layout_key = None
-                return "break"
-            if ks in ("plus", "equal", "KP_Add"):
-                self._bump_fps(+1.0)
-                return "break"
-            if ks in ("minus", "KP_Subtract"):
-                self._bump_fps(-1.0)
-                return "break"
-            if len(ks) == 1 and ks.isdigit() and ks != "0":
-                n = int(ks) - 1
-                if n < len(self.tiles):
-                    self._select(n)
-                return "break"
+        # Ctrl+Tab / Ctrl+Shift+Tab cycle through tiles.
+        # Not gated on Alt state: if the user held Alt before pressing Ctrl+Tab,
+        # the old guard failed, _flush_alt_to_slave() ran, and the slave received
+        # Alt+Tab.  Clear any pending Alt here so it is never flushed afterwards.
+        if ctrl and ks in ("Tab", "ISO_Left_Tab"):
+            if self._alt_held and not self._alt_combo:
+                self._alt_held = False   # discard pending Alt silently
+            self._cycle(-1 if (shift or ks == "ISO_Left_Tab") else 1)
             return "break"
 
+        # Alt+1…Alt+0: always consume, even if this tile is already active.
+        if self._alt_down(event) and len(ks) == 1 and ks.isdigit():
+            self._pick_tile_by_digit(ks)
+            return "break"
+
+        # ` (backtick/grave, VK 192) toggles zoom.  Match both the keysym AND
+        # the physical key code so the binding works in any keyboard layout.
+        # Trade-off: ё (same physical key in Russian layout) cannot be typed
+        # through the viewer — it will toggle zoom instead.
+        # Z / Я and every other letter key pass straight through.
+        if ks == "grave" or event.keycode == 192:
+            self.zoomed = not self.zoomed
+            self._layout_key = None
+            return "break"
+
+        # +/- retune the active-tile frame rate.
+        if ks in ("plus", "equal", "KP_Add"):
+            self._bump_fps(+1.0)
+            return "break"
+        if ks in ("minus", "KP_Subtract"):
+            self._bump_fps(-1.0)
+            return "break"
+
+        # Alt + anything else: now it is not a tile switch, so send Alt down.
+        if self._alt_held and not self._alt_combo:
+            self._flush_alt_to_slave()
+
+        # ── Forward everything else to the active slave ───────────────────────
         link = self._selected_link()
         if link is None:
             return "break"
         name = keysym_to_name(event)
         if name is None or name in self.held_keys:
             return "break"        # Tk repeats KeyPress while held; send once
+        if name in ("alt", "ralt"):
+            return "break"
         self.held_keys.add(name)
         link.send({"t": "kdown", "key": name})
         return "break"
 
     def _on_key_up(self, event):
-        if not self.passthrough:
+        ks = event.keysym
+
+        if ks in ("Alt_L", "Alt_R"):
+            used = self._alt_combo
+            self._alt_held = False
+            self._alt_combo = False
+            if used:
+                # Tile switch: swallow Alt-up as well. Lift a flushed Alt if
+                # one somehow went out.
+                self._unsend_keys(("alt", "ralt"))
+                return "break"
+
+        # Digit that belonged to Alt+N must not produce a leftover key-up.
+        if (self._alt_held or self._alt_combo) and len(ks) == 1 and ks.isdigit():
             return "break"
+
         link = self._selected_link()
         name = keysym_to_name(event)
         if link is None or name is None or name not in self.held_keys:
@@ -748,24 +900,27 @@ class Viewer:
         link.send({"t": "kup", "key": name})
         return "break"
 
+    def _on_alt_digit(self, digit):
+        """Select tile by number via Alt+1…Alt+0 (0 = tenth tile)."""
+        self._alt_held = True
+        self._pick_tile_by_digit(digit)
+        return "break"
+
     def _bump_fps(self, delta):
         lo, hi = FPS_LIMITS
         self.active_fps = min(hi, max(lo, self.active_fps + delta))
-        link = self._selected_link()
-        if link is not None:
-            link.set_active(True, self.active_fps)
+        sel_link = self._selected_link()
+        if sel_link is not None:
+            sel_link.set_active(True, self.active_fps)
+        # Keep fps_locked tiles in sync with the new active rate.
+        for t in self.tiles:
+            if t.fps_locked and t.link is not sel_link:
+                t.link.set_active(True, self.active_fps)
 
     def _selected_link(self):
         if self.selected is None:
             return None
         return self.tiles[self.selected].link
-
-    def _toggle_passthrough(self):
-        if not self.passthrough and self.selected is None:
-            return
-        self.passthrough = not self.passthrough
-        if not self.passthrough:
-            self._release_keys(self._selected_link())
 
     def _release_keys(self, link):
         if link is None:
@@ -776,8 +931,7 @@ class Viewer:
         self.held_keys.clear()
 
     def _panic(self):
-        """Let go of everything on every slave. Cheap insurance."""
-        self.passthrough = False
+        """Let go of everything on every slave. Used on viewer shutdown."""
         self.held_keys.clear()
         self._pan = None
         for t in self.tiles:

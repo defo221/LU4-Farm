@@ -120,6 +120,33 @@ def cursor_pos():
     return 0, 0
 
 
+def keyboard_layout():
+    """Current keyboard layout of the foreground window as a 2-letter ISO tag.
+
+    Uses GetForegroundWindow → GetWindowThreadProcessId → GetKeyboardLayout to
+    read the layout that belongs to the game window's thread, not the sender's
+    own thread.  GetKeyboardLayoutNameW would only reflect the sender thread's
+    layout and stays 'EN' even after the game switches to 'RU'.
+    """
+    if sys.platform != "win32" or _user32 is None:
+        return ""
+    try:
+        u32 = _user32
+        u32.GetForegroundWindow.restype        = ctypes.c_void_p
+        u32.GetWindowThreadProcessId.restype   = ctypes.c_uint
+        u32.GetKeyboardLayout.restype          = ctypes.c_void_p
+        hwnd = u32.GetForegroundWindow()
+        tid  = u32.GetWindowThreadProcessId(hwnd, None)
+        hkl  = u32.GetKeyboardLayout(tid)      # HKL handle for that thread
+        lcid = (hkl or 0) & 0xFFFF            # low WORD is the locale/language ID
+        lang_buf = ctypes.create_unicode_buffer(16)
+        # LOCALE_SISO639LANGNAME (0x0059) → "en", "ru", "de", …
+        ctypes.windll.kernel32.GetLocaleInfoW(lcid, 0x0059, lang_buf, 16)
+        return lang_buf.value.upper()          # → "EN", "RU", "DE", …
+    except Exception:
+        return ""
+
+
 def raise_timer_resolution():
     """Ask Windows for 1 ms timer granularity.
 
@@ -833,6 +860,7 @@ class Session:
                         # Live, not just at hello: capture can fail over to mss
                         # mid-session and the label should follow.
                         "cap": self.cap.backend,
+                        "lang": keyboard_layout(),
                     })
 
 

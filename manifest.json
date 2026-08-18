@@ -68,8 +68,8 @@
     "size": 175
   },
   "updater.py": {
-    "sha256": "eaacfd1237684a83cb676e231d04d6860b3347bfed1b4b74a5579131bc2ec123",
-    "size": 19466
+    "sha256": "3737bdfbedb9a8266602760c59e0bbb14ad8eafba30eabf7b759b3d46a3fe233",
+    "size": 19499
   },
   "make_manifest.bat": {
     "sha256": "ed9bfc75cacabba73e1a64e5e7dc8e77e8e8bfb56f662981588d4b8ee696579f",
@@ -92,28 +92,32 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "5b24b0dd4ce21dc44707ccd4a26a366a4583773659e9e8525cc26a41a95a1735",
-    "size": 36344
+    "sha256": "44f703e3df3423e18274401ffbcaf75e5985d93de4715899e483b5f3c830b2a5",
+    "size": 37699
   },
   "stream_viewer.py": {
-    "sha256": "e06a2a365b9ec31b6f3894ff25663f550792f585ce88dfd77d40630e416ffff2",
-    "size": 32743
+    "sha256": "8e6ce7ad935f6e19d30768a4340abe17071cba94a966abdcd200fce91007bab9",
+    "size": 40471
   },
   "bench_capture.py": {
     "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
     "size": 7705
   },
   "run_stream_sender.bat": {
-    "sha256": "fc3db45e7cfbe97676d55b9f64bb715c62e5b8e51dcdf87d352d1f59ce9ab027",
-    "size": 1348
+    "sha256": "1d043011e19f7ba509b89ab55023130ad824ae87ba47f019cde7aff4cf86cd03",
+    "size": 1722
   },
   "run_stream_viewer.bat": {
     "sha256": "85d036637abf4cabe5eac183806aae7db298abe18800c941e0fcc304c1e0878b",
     "size": 285
   },
   "setup_slave_firewall.bat": {
-    "sha256": "976823bde662685225af094f9e51ea154de6cc73122494990661895d552ff940",
-    "size": 2650
+    "sha256": "9811c7fe2f17e0ba78a371c9dbddb900a71e0f4ebb223fd73264ff490dc30936",
+    "size": 828
+  },
+  "setup_slave_firewall.ps1": {
+    "sha256": "781aedf9824db2c2cb0376943c3e69f3a8f55aebc6080e280d3ecebbf8f29366",
+    "size": 2235
   },
   "mouse.ino": {
     "sha256": "fb4b76d7aaf97fef3975952542bb67cd8e0061c5a1c3d995767a1d3e2b5be4f0",

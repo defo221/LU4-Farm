@@ -86,6 +86,7 @@ TRACKED_CODE = [
     "run_stream_sender.bat",
     "run_stream_viewer.bat",
     "setup_slave_firewall.bat",
+    "setup_slave_firewall.ps1",
     "mouse.ino",
     "l2cursor.cur",
 ]

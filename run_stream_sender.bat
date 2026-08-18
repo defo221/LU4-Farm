@@ -23,6 +23,15 @@
 :: viewer labels that tile SLOW CAPTURE.
 
 cd /d "%~dp0"
+
+:: First run on a new PC: Windows often creates a hidden python.exe BLOCK rule
+:: the first time a listener opens. Open the port before we bind it.
+netsh advfirewall firewall show rule name="PXM stream sender" >nul 2>&1
+if errorlevel 1 (
+    echo First run: opening firewall for TCP 8772. Approve the UAC prompt.
+    call "%~dp0setup_slave_firewall.bat" silent
+)
+
 python -c "import dxcam" 2>nul || python -m pip install --quiet --disable-pip-version-check dxcam
 python stream_sender.py %*
 pause
