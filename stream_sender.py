@@ -3,14 +3,14 @@ stream_sender.py - runs on each slave PC.
 
 Two loops share one TCP connection to the main PC's viewer:
 
-  1. capture loop    mss grab -> optional downscale -> JPEG -> push to viewer
+  1. capture loop    screen grab -> optional downscale -> JPEG -> push to viewer
   2. command loop    receive high-level JSON -> translate to Arduino serial commands
 
 STRICT RULE: every click, cursor move, scroll and keypress is produced by the
 Arduino USB HID device.  This process never injects input.  It only *reads*
 state that it is not allowed to write:
 
-  * mss screen grabs                       (reading pixels)
+  * dxcam / mss screen grabs               (reading pixels)
   * GetCursorPos                           (reading where the cursor is, so the
                                             Arduino's relative move can be aimed)
   * SetProcessDpiAwareness                 (so those reads are in real pixels)
@@ -31,8 +31,17 @@ import threading
 import time
 
 import cv2
-import mss
 import numpy as np
+
+try:
+    import dxcam                                           # DXGI fast path
+except Exception:
+    dxcam = None
+
+try:
+    import mss                                             # GDI fallback
+except Exception:
+    mss = None
 
 import stream_proto as proto
 from stream_proto import Channel
@@ -375,16 +384,130 @@ class HidLink:
 
 
 # ── screen capture ────────────────────────────────────────────────────────────
+# Two read-only backends. DXGI Desktop Duplication (dxcam) maps the surface the
+# compositor has already produced, so a grab costs ~1 ms; mss goes through a GDI
+# BitBlt readback and costs ~20 ms on the same machine. mss stays as a fallback
+# because dxcam needs a real DXGI output: it is unavailable over RDP, on some
+# virtualised GPUs, and on a slave where nobody has pip-installed it yet.
+# Falling back is fine for *reading* pixels - input has no fallback and is
+# Arduino-only by design.
+
+CAPTURE_STALE_S = 2.0          # re-encode this often even if nothing moved
+
+# OpenCV fans resize and imencode out across every core by default. Measured on
+# a 2560x1440 slave (bench_capture.py, 120 frames/cell): encoding a full-size
+# frame is just as fast on one thread as on sixteen (13.2 ms vs 13.0 ms wall)
+# because JPEG entropy coding barely parallelises, but it costs half the CPU
+# (13.8 ms vs 25.3 ms). Downscaled grid frames do get faster with more threads,
+# yet an idle tile at 1 fps has no use for the wall time. Cores handed back here
+# go to the game and the bot agent instead.
+CV_THREADS = 2
+
+# DXGI duplication really does break at runtime - a resolution change, a driver
+# reset or a game taking exclusive fullscreen all invalidate it. After this many
+# consecutive errors the slave gives up and finishes the session on mss, which
+# the viewer shows as SLOW CAPTURE. Serving the last cached frame forever would
+# leave a frozen tile that still claims to be online.
+DX_FAIL_LIMIT = 5
+
+_dx_camera = None
+_dx_broken = False
+_dx_fails = 0
+_dx_last = None                # newest full-screen BGR array, outlives sessions
+
+
+def force_backend(name):
+    """Pin the capture backend, for diagnosing one slave (--capture)."""
+    global _dx_broken
+    if name == "mss":
+        _dx_broken = True
+
+
+def dx_camera():
+    """Create the process-wide dxcam camera once, or None if unavailable.
+
+    dxcam refuses a second camera for the same output, and Sessions come and go
+    as viewers reconnect, so the camera has to outlive any single Session.
+    """
+    global _dx_camera, _dx_broken
+    if _dx_camera is not None or _dx_broken:
+        return _dx_camera
+    if dxcam is None:
+        _dx_broken = True
+        return None
+    try:
+        # BGR straight from the duplicator: imencode wants BGR anyway, so this
+        # removes the BGRA->BGR conversion that mss needs.
+        _dx_camera = dxcam.create(output_idx=0, output_color="BGR")
+    except Exception as e:
+        logger.warn(f"[CAP] dxcam init failed: {e}")
+        _dx_camera = None
+    if _dx_camera is None:
+        _dx_broken = True
+    return _dx_camera
+
+
+def dx_grab():
+    """(full_screen_bgr, fresh) from the duplicator.
+
+    fresh is False when DXGI had no new frame and this is the cached one. The
+    cache is module-level so a reconnecting viewer gets pixels immediately
+    instead of waiting for something on screen to move.
+    """
+    global _dx_last, _dx_fails
+    cam = dx_camera()
+    if cam is None:
+        return None, False
+    try:
+        f = cam.grab()
+    except Exception as e:
+        _dx_fails += 1
+        logger.warn(f"[CAP] dxcam grab failed ({_dx_fails}): {e}")
+        # Skip this frame rather than re-serving the cache: one missed frame is
+        # invisible at 12 fps, a permanently stale one is not.
+        return None, False
+    _dx_fails = 0
+    if f is None:
+        return _dx_last, False
+    _dx_last = f
+    return f, True
+
+
+def dx_dead():
+    return _dx_fails >= DX_FAIL_LIMIT
+
+
 class Capturer:
-    """Owns the mss instance. Must be used from a single thread."""
+    """Grabs one region, scales it and JPEG-encodes it. Single-threaded.
+
+    grab() returns None when there is nothing worth sending: the screen has not
+    changed since the viewer's last frame, or encoding failed. The capture loop
+    already treats None as "skip this tick".
+    """
 
     def __init__(self):
-        self._sct = mss.mss()
-        mon = self._sct.monitors[1]               # [0] is the union of all screens
-        self.screen = (mon["left"], mon["top"], mon["width"], mon["height"])
-        self.region = self.screen
         self.scale = DEFAULT_SCALE
         self.quality = DEFAULT_QUALITY
+        self.unchanged = 0         # grabs skipped because nothing moved
+
+        self._sct = None
+        cam = dx_camera()
+        if cam is not None:
+            self.backend = "dxcam"
+            self.screen = (0, 0, int(cam.width), int(cam.height))
+        elif mss is not None:
+            # mss.mss() is deprecated in mss 10 but MSS is missing from old ones.
+            self._sct = (getattr(mss, "MSS", None) or mss.mss)()
+            mon = self._sct.monitors[1]           # [0] is the union of all screens
+            self.backend = "mss"
+            self.screen = (mon["left"], mon["top"], mon["width"], mon["height"])
+        else:
+            raise RuntimeError("no capture backend - pip install dxcam")
+        self.region = self.screen
+        logger.info(f"[CAP] {self.backend} {self.screen[2]}x{self.screen[3]}")
+
+        self._sent_key = None
+        self._sent_at = 0.0
 
     def set_region(self, x, y, w, h):
         if w <= 0 or h <= 0:
@@ -392,30 +515,83 @@ class Capturer:
         else:
             self.region = (int(x), int(y), int(w), int(h))
 
+    def _fall_back_to_mss(self):
+        """Finish the session on GDI after DXGI has given up."""
+        if mss is None:
+            logger.error("[CAP] dxcam died and mss is not installed - no capture")
+            return False
+        self._sct = (getattr(mss, "MSS", None) or mss.mss)()
+        self.backend = "mss"
+        logger.warn("[CAP] dxcam failed repeatedly - switched to mss for this session")
+        return True
+
     def grab(self):
-        """Return ((rx, ry, rw, rh), jpeg_bytes) or None if encoding failed."""
-        rx, ry, rw, rh = self.region
-        shot = self._sct.grab({"left": rx, "top": ry, "width": rw, "height": rh})
-        # mss gives BGRA; cvtColor also hands back a contiguous buffer, which
-        # imencode needs (a [:, :, :3] slice is a non-contiguous view).
-        img = cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+        """((rx, ry, rw, rh), jpeg_bytes), or None if there is nothing to send."""
+        if self._sct is None:
+            full, fresh = dx_grab()
+            if full is None:
+                if dx_dead() and not self._fall_back_to_mss():
+                    raise RuntimeError("capture backend lost")
+                return None
+            h, w = full.shape[:2]
+            rx, ry, rw, rh = self._clip(self.region, w, h)
+            if rw <= 0 or rh <= 0:
+                return None
+            key = (rx, ry, rw, rh, round(self.scale, 4), int(self.quality))
+            # Re-encoding an unchanged screen is pure waste unless the viewer
+            # asked for something different or its frame is going stale.
+            if not fresh and key == self._sent_key and \
+                    time.perf_counter() - self._sent_at < CAPTURE_STALE_S:
+                self.unchanged += 1
+                return None
+            img = full[ry:ry + rh, rx:rx + rw]
+        else:
+            rx, ry, rw, rh = self.region
+            shot = self._sct.grab({"left": rx, "top": ry,
+                                   "width": rw, "height": rh})
+            # mss gives BGRA; cvtColor also hands back a contiguous buffer, which
+            # imencode needs (a [:, :, :3] slice is a non-contiguous view).
+            img = cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+            key = (rx, ry, rw, rh, round(self.scale, 4), int(self.quality))
+
         if self.scale < 0.999:
             dw = max(int(rw * self.scale), 16)
             dh = max(int(rh * self.scale), 16)
             # INTER_AREA costs a few ms more than INTER_LINEAR but keeps small
             # UI text legible, which is the whole point of looking at the tile.
             img = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
+        elif not img.flags["C_CONTIGUOUS"]:
+            # An unscaled dxcam crop is a view into the cached full frame.
+            img = np.ascontiguousarray(img)
+
         ok, buf = cv2.imencode(".jpg", img,
                                [int(cv2.IMWRITE_JPEG_QUALITY), int(self.quality)])
         if not ok:
             return None
+        self._sent_key = key
+        self._sent_at = time.perf_counter()
         return (rx, ry, rw, rh), buf.tobytes()
 
+    @staticmethod
+    def _clip(region, w, h):
+        """Clip an absolute region to the captured frame, as (x, y, w, h).
+
+        The viewer maps clicks with whatever geometry we report, so a clipped
+        grab has to report the clipped region rather than the requested one.
+        """
+        rx, ry, rw, rh = region
+        x0, y0 = max(0, int(rx)), max(0, int(ry))
+        x1 = min(w, int(rx) + int(rw))
+        y1 = min(h, int(ry) + int(rh))
+        return x0, y0, x1 - x0, y1 - y0
+
     def close(self):
-        try:
-            self._sct.close()
-        except Exception:
-            pass
+        if self._sct is not None:
+            try:
+                self._sct.close()
+            except Exception:
+                pass
+        # The dxcam camera is shared and deliberately outlives this Session.
 
 
 # ── one viewer connection ─────────────────────────────────────────────────────
@@ -569,6 +745,7 @@ class Session:
             "t": "hello", "name": self.name,
             "sx": sx, "sy": sy, "sw": sw, "sh": sh,
             "arduino": self.hid.connected,
+            "cap": self.cap.backend,
             "warn": self.warnings,
         })
         threading.Thread(target=self._reader, daemon=True).start()
@@ -646,11 +823,16 @@ class Session:
             if wall - self._stat_at >= 1.0:
                 self._stat_at = wall
                 dropped, self._dropped = self._dropped, 0
+                same, self.cap.unchanged = self.cap.unchanged, 0
                 self.chan.send_json({
                         "t": "stat",
                         "ms": round(self._build_ms, 1),
                         "kb": round(len(jpeg) / 1024.0, 1),
                         "drop": dropped,
+                        "same": same,
+                        # Live, not just at hello: capture can fail over to mss
+                        # mid-session and the label should follow.
+                        "cap": self.cap.backend,
                     })
 
 
@@ -707,11 +889,15 @@ def main():
     ap.add_argument("--name", default=socket.gethostname(), help="label shown in the viewer")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port to listen on")
     ap.add_argument("--arduino", default="", help="Arduino COM port, e.g. COM12")
+    ap.add_argument("--capture", default="auto", choices=("auto", "dxcam", "mss"),
+                    help="force a capture backend instead of preferring dxcam")
     args = ap.parse_args()
 
+    force_backend(args.capture)
     make_dpi_aware()
     if not raise_timer_resolution():
         logger.warn("[NET] no 1ms timer - frame pacing will be coarse")
+    cv2.setNumThreads(CV_THREADS)
 
     arduino_port = args.arduino
     if not arduino_port:

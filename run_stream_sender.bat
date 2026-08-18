@@ -16,7 +16,13 @@
 :: the input itself comes from the Arduino, not from this process.
 ::
 :: The target game window must stay expanded - a minimized window captures black.
+::
+:: Capture uses dxcam (DXGI Desktop Duplication), which is about twice as fast as
+:: the mss fallback. It is installed on first run below rather than by hand on
+:: nine machines. If it cannot be installed the sender still works on mss and the
+:: viewer labels that tile SLOW CAPTURE.
 
 cd /d "%~dp0"
+python -c "import dxcam" 2>nul || python -m pip install --quiet --disable-pip-version-check dxcam
 python stream_sender.py %*
 pause

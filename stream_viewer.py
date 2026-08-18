@@ -104,7 +104,7 @@ _CURSOR_DATA = _load_cur(_CUR_PATH)   # (rgba, hx, hy) or None
 
 # ── tuning ────────────────────────────────────────────────────────────────────
 IDLE_FPS = 5.0                 # tiles you are not touching
-ACTIVE_FPS = 15.0              # the selected tile; +/- retunes this live
+ACTIVE_FPS = 25.0              # the selected tile; +/- retunes this live
 FPS_LIMITS = (1.0, 30.0)
 UI_HZ = 30                     # redraw rate
 PAN_SEND_HZ = 25               # cap on moverel messages while right-dragging
@@ -175,6 +175,8 @@ class SlaveLink:
         self.build_ms = 0.0       # slave-reported cost of one frame
         self.frame_kb = 0.0
         self.dropped = 0          # frames/sec the sender skipped to stay paced
+        self.unchanged = 0        # frames/sec skipped because the screen was still
+        self.capture = ""         # slave's capture backend: dxcam | mss
 
         # what the sender should produce; resent whenever the layout changes
         self.want_scale = 0.34
@@ -245,6 +247,7 @@ class SlaveLink:
             self.screen = (obj.get("sx", 0), obj.get("sy", 0),
                            obj.get("sw", 1920), obj.get("sh", 1080))
             self.arduino = bool(obj.get("arduino"))
+            self.capture = str(obj.get("cap", ""))
             warns = obj.get("warn") or []
             self.note = warns[0] if warns else ("" if self.arduino else "no Arduino")
             self.status = "online"
@@ -253,6 +256,8 @@ class SlaveLink:
             self.build_ms = float(obj.get("ms", 0.0))
             self.frame_kb = float(obj.get("kb", 0.0))
             self.dropped = int(obj.get("drop", 0))
+            self.unchanged = int(obj.get("same", 0))
+            self.capture = str(obj.get("cap", self.capture))
         elif t == "error":
             self.note = obj.get("msg", "")
 
@@ -527,6 +532,12 @@ class Viewer:
                 bits.append(f"{link.build_ms:.0f}ms {core:.0f}%core")
             if link.dropped:
                 bits.append(f"-{link.dropped}/s")
+            if link.unchanged:
+                # Explains a low fps: the screen was still, so those frames
+                # were never encoded rather than lost.
+                bits.append(f"={link.unchanged}/s")
+            if link.capture == "mss":
+                bits.append("SLOW CAPTURE (pip install dxcam)")
             if not link.arduino:
                 bits.append("NO ARDUINO")
         if link.note:

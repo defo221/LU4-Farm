@@ -80,6 +80,9 @@ TRACKED_CODE = [
     "stream_proto.py",
     "stream_sender.py",
     "stream_viewer.py",
+    # Capture benchmark: run it on a slave to confirm dxcam is installed and
+    # working there, and to see that machine's frame-rate ceiling.
+    "bench_capture.py",
     "run_stream_sender.bat",
     "run_stream_viewer.bat",
     "setup_slave_firewall.bat",

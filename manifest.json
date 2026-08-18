@@ -68,8 +68,8 @@
     "size": 175
   },
   "updater.py": {
-    "sha256": "44654c755254701e7bafba46ca0e5cdc690467685c6c873a796223a559b6af29",
-    "size": 19295
+    "sha256": "eaacfd1237684a83cb676e231d04d6860b3347bfed1b4b74a5579131bc2ec123",
+    "size": 19466
   },
   "make_manifest.bat": {
     "sha256": "ed9bfc75cacabba73e1a64e5e7dc8e77e8e8bfb56f662981588d4b8ee696579f",
@@ -92,16 +92,20 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "9e3fdf2b9e92e66ca1d2ced91e62bdd01e9919b4b81b75f332154064d119df3e",
-    "size": 28687
+    "sha256": "5b24b0dd4ce21dc44707ccd4a26a366a4583773659e9e8525cc26a41a95a1735",
+    "size": 36344
   },
   "stream_viewer.py": {
-    "sha256": "7c70e41b019c738e7cb55890395c7569e389194358d78cf31c9378c33e8ea684",
-    "size": 31060
+    "sha256": "e06a2a365b9ec31b6f3894ff25663f550792f585ce88dfd77d40630e416ffff2",
+    "size": 32743
+  },
+  "bench_capture.py": {
+    "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
+    "size": 7705
   },
   "run_stream_sender.bat": {
-    "sha256": "56ce0e3b6536baa5b8ef7fc083c7c2c391b9dcebf76aede39ae3d5fa9f235ad4",
-    "size": 957
+    "sha256": "fc3db45e7cfbe97676d55b9f64bb715c62e5b8e51dcdf87d352d1f59ce9ab027",
+    "size": 1348
   },
   "run_stream_viewer.bat": {
     "sha256": "85d036637abf4cabe5eac183806aae7db298abe18800c941e0fcc304c1e0878b",
