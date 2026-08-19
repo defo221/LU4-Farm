@@ -410,9 +410,18 @@ class TG:
 # ---------------------------------------------------------------------------
 
 class FarmBot:
-    def __init__(self):
-        port = cfg.ARDUINO_PORT or find_arduino_port("Arduino")
-        self.hid  = ArduinoHID(port, cfg.ARDUINO_BAUD)
+    def __init__(self, shared_arduino=None, viewer_manual=None):
+        if shared_arduino is not None:
+            # Shared instance provided by stream_sender — don't open/close it.
+            self.hid = shared_arduino
+            self._shared_arduino = True
+        else:
+            port = cfg.ARDUINO_PORT or find_arduino_port("Arduino")
+            self.hid = ArduinoHID(port, cfg.ARDUINO_BAUD)
+            self._shared_arduino = False
+
+        if viewer_manual is not None:
+            capslock.register_viewer_manual(viewer_manual)
         self._notifier = Notifier(cfg.TG_TOKEN, cfg.TG_CHAT_ID)
         self.tg   = TG(self._notifier)
         self.sct  = _mss_mod.MSS()
@@ -509,7 +518,7 @@ class FarmBot:
                     ", ".join(f"{k}={'ON' if s.enabled else 'OFF'}"
                               for k, s in self.slots.items()))
 
-        if not self.hid.connect():
+        if not self._shared_arduino and not self.hid.connect():
             logger.error("[BOT] Arduino not connected — aborting")
             return
 
@@ -609,7 +618,8 @@ class FarmBot:
         except KeyboardInterrupt:
             logger.info("[BOT] Interrupted by user.")
         finally:
-            self.hid.close()
+            if not self._shared_arduino:
+                self.hid.close()
             self._notifier.stop()
             self.sct.close()
 
@@ -998,7 +1008,9 @@ class FarmBot:
         root.bind("<Return>",          _confirm)
         root.bind("<KP_Enter>",        _confirm)
         root.bind("<Escape>",          _cancel)
-        root.focus_force()
+        # Defer focus grab until after the window is fully mapped so the OS
+        # actually hands it focus without requiring a click first.
+        root.after(0, lambda: (root.lift(), root.focus_force()))
         root.mainloop()
         return result[0]
 
@@ -1071,11 +1083,7 @@ class FarmBot:
 
         # ── Phase 2: crosshair calibration for each assist window ───────────
         for slot in assist_slots:
-            print(f"\n  Switching to '{slot.title}' in ", end="", flush=True)
-            for i in range(3, 0, -1):
-                print(f"{i}... ", end="", flush=True)
-                time.sleep(0.5)
-            print()
+            print(f"\n  Switching to '{slot.title}'...")
             self._switch_to(slot)
             print(f"  A crosshair window will appear on the left side of the screen.")
             print(f"  Drag it over the party bar for '{slot.title}' and press Enter.")

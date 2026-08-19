@@ -24,7 +24,9 @@ Usage (one .bat per slave, see run_stream_sender.bat):
 """
 
 import argparse
+import atexit
 import ctypes
+import signal
 import socket
 import sys
 import threading
@@ -70,8 +72,8 @@ except Exception:
 DEFAULT_PORT = 8772
 DEFAULT_BAUD = 9600
 
-IDLE_FPS = 1.0                 # tiles nobody is looking at
-ACTIVE_FPS = 12.0              # tile currently being interacted with
+IDLE_FPS = 5.0                 # tiles nobody is looking at
+ACTIVE_FPS = 20.0              # tile currently being interacted with
 DEFAULT_SCALE = 0.34           # 1920x1080 -> ~653x367, fits a 3x3 grid tile
 DEFAULT_QUALITY = 60
 
@@ -97,6 +99,7 @@ VALID_KEYS = set(
     "up", "down", "left", "right", "space",
     "ctrl", "lctrl", "rctrl", "alt", "lalt", "ralt",
     "shift", "lshift", "rshift", "gui", "win", "lwin", "rwin",
+    "capslock",
 } | {f"f{i}" for i in range(1, 13)}
 
 VALID_BUTTONS = {"left", "right", "middle"}
@@ -410,6 +413,142 @@ class HidLink:
         return bool(self._held_buttons or self._held_keys)
 
 
+# ── ArduinoHID shim ───────────────────────────────────────────────────────────
+class ArduinoHIDAdapter:
+    """Exposes the common.arduino_hid.ArduinoHID interface backed by a live
+    HidLink.  Lets agent/main.py drive the same serial port without owning it.
+    The HidLink's internal lock serialises bot commands and viewer commands so
+    neither corrupts the other's serial framing.
+    """
+
+    def __init__(self, hid: HidLink):
+        self._hid = hid
+        self.wait_after_click = 0.05
+        self.wait_after_scroll = 0.05
+
+    # ---- lifecycle -----------------------------------------------------------
+    @property
+    def connected(self):
+        return self._hid.connected
+
+    def connect(self):
+        return self._hid.connected   # port is already open
+
+    def close(self):
+        pass                         # HidLink owns the port; sender closes it
+
+    # ---- movement ------------------------------------------------------------
+    def move_to(self, x, y):
+        return self._hid.move_abs(x, y)
+
+    # ---- clicks --------------------------------------------------------------
+    def click_left(self):
+        ok = self._hid._tell("CLICK_LEFT")
+        time.sleep(self.wait_after_click)
+        return ok
+
+    def click_left_hold(self, hold_min=20, hold_max=50):
+        r = self._hid._ask(f"CLICK_LEFT_HOLD,{hold_min},{hold_max}")
+        ms = int(r) if r.isdigit() else (hold_min + hold_max) // 2
+        time.sleep(self.wait_after_click)
+        return ms
+
+    def click_right_hold(self, hold_min=20, hold_max=50, wait_after=None):
+        r = self._hid._ask(f"CLICK_RIGHT_HOLD,{hold_min},{hold_max}")
+        ms = int(r) if r.isdigit() else (hold_min + hold_max) // 2
+        delay = self.wait_after_click if wait_after is None else wait_after
+        if delay > 0:
+            time.sleep(delay)
+        return ms
+
+    def triple_click(self, hold_min=20, hold_max=50, gap_min=20, gap_max=50):
+        r = self._hid._ask(
+            f"TRIPLE_CLICK,{hold_min},{hold_max},{gap_min},{gap_max}")
+        return int(r) if r.isdigit() else (hold_min + hold_max) // 2 * 3
+
+    def shift_left_click_hold(self, hold_min=40, hold_max=80):
+        r = self._hid._ask(f"SHIFT_CLICK_LEFT,{hold_min},{hold_max}")
+        ms = int(r) if r.isdigit() else (hold_min + hold_max) // 2
+        time.sleep(self.wait_after_click)
+        return ms
+
+    def move_and_shift_click(self, x, y, hold_min=40, hold_max=80):
+        self.move_to(x, y)
+        return self.shift_left_click_hold(hold_min, hold_max) > 0
+
+    def shift_right_click_hold(self, hold_min=40, hold_max=80):
+        r = self._hid._ask(f"SHIFT_CLICK_RIGHT,{hold_min},{hold_max}")
+        ms = int(r) if r.isdigit() else (hold_min + hold_max) // 2
+        time.sleep(self.wait_after_click)
+        return ms
+
+    def move_and_shift_right_click(self, x, y, hold_min=40, hold_max=80):
+        self.move_to(x, y)
+        return self.shift_right_click_hold(hold_min, hold_max) > 0
+
+    def double_click_at(self, x, y, gap_min=80, gap_max=160, y_shift=0):
+        import random as _rnd
+        self.move_to(x, y + y_shift)
+        return self._hid._tell(f"DOUBLE_CLICK,{_rnd.randint(gap_min, gap_max)}")
+
+    def multi_click_at(self, x, y, count_min=15, count_max=20,
+                       interval_min_ms=80, interval_max_ms=120):
+        import random as _rnd
+        self.move_to(x, y)
+        for _ in range(_rnd.randint(count_min, count_max)):
+            self._hid._tell("CLICK_LEFT")
+            time.sleep(_rnd.randint(interval_min_ms, interval_max_ms) / 1000.0)
+        return True
+
+    def move_and_click(self, x, y, hold_min=20, hold_max=50):
+        self.move_to(x, y)
+        return self.click_left_hold(hold_min, hold_max) > 0
+
+    def move_and_right_click(self, x, y, hold_min=40, hold_max=80,
+                              wait_after=None):
+        self.move_to(x, y)
+        return self.click_right_hold(hold_min, hold_max, wait_after=wait_after) > 0
+
+    def move_and_click_offset(self, x, y, off_min=3, off_max=9,
+                               hold_min=20, hold_max=50):
+        import random as _rnd
+        ox = _rnd.randint(off_min, off_max) * _rnd.choice((1, -1))
+        oy = _rnd.randint(off_min, off_max) * _rnd.choice((1, -1))
+        self.move_to(int(x + ox), int(y + oy))
+        return self.click_left_hold(hold_min, hold_max) > 0
+
+    # ---- scroll --------------------------------------------------------------
+    def scroll(self, steps):
+        ok = self._hid.scroll(steps)
+        time.sleep(self.wait_after_scroll)
+        return ok
+
+    # ---- keyboard ------------------------------------------------------------
+    def press_key(self, key_name, hold_ms=50):
+        ok = self._hid._tell(f"KEY,{key_name},{hold_ms}")
+        time.sleep(hold_ms / 1000.0 + 0.05)
+        return ok
+
+    def press_key_combo(self, *keys, hold_ms=50, wait_after_s=0.05):
+        if not keys:
+            return False
+        ok = self._hid._tell(f"KEY_COMBO,{hold_ms}," + ",".join(str(k) for k in keys))
+        time.sleep(hold_ms / 1000.0 + wait_after_s)
+        return ok
+
+    def shift_key(self, key_name, hold_ms=50, pre_delay_ms=80, wait_after_s=0.05):
+        ok = self._hid._tell(f"SHIFT_KEY,{key_name},{hold_ms},{pre_delay_ms}")
+        time.sleep((pre_delay_ms + hold_ms + 40) / 1000.0 + wait_after_s)
+        return ok
+
+    def type_text(self, text, per_char_ms=40):
+        if not text or "\n" in text or "\r" in text:
+            return False
+        ok = self._hid._tell(f"TYPE,{per_char_ms},{text}")
+        time.sleep(len(text) * (per_char_ms + 8) / 1000.0 + 0.05)
+        return ok
+
+
 # ── screen capture ────────────────────────────────────────────────────────────
 # Two read-only backends. DXGI Desktop Duplication (dxcam) maps the surface the
 # compositor has already produced, so a grab costs ~1 ms; mss goes through a GDI
@@ -623,7 +762,8 @@ class Capturer:
 
 # ── one viewer connection ─────────────────────────────────────────────────────
 class Session:
-    def __init__(self, chan, hid, name, warnings):
+    def __init__(self, chan, hid, name, warnings,
+                 viewer_manual=None, bot=None):
         self.chan = chan
         self.hid = hid
         self.name = name
@@ -632,14 +772,12 @@ class Session:
         self.fps = IDLE_FPS
         self.stop = threading.Event()
         self.last_msg = time.time()
-        # Smoothed cost of building one frame (grab + convert + resize + encode).
-        # Reported to the viewer so you can see how much of a core this is using
-        # before raising the frame rate on a machine that is already busy.
+        # shared Event set while the viewer has this tile in focus; pauses the bot
+        self.viewer_manual = viewer_manual or threading.Event()
+        # FarmBot instance, or None when not running
+        self._bot = bot
         self._build_ms = 0.0
         self._stat_at = 0.0
-        # One-slot handoff to the paced sender thread. Latest frame wins; a
-        # queue here would trade latency for throughput, which is the wrong
-        # trade for a remote control.
         self._outbox = None
         self._outbox_cv = threading.Condition()
         self._dropped = 0
@@ -664,6 +802,14 @@ class Session:
             return
         if t == "ping":
             self.chan.send_json({"t": "pong"})
+            return
+        if t == "manual":
+            # Viewer is telling us whether it has manual focus on this tile.
+            # Set/clear the shared event so the bot pauses/resumes instantly.
+            if cmd.get("v"):
+                self.viewer_manual.set()
+            else:
+                self.viewer_manual.clear()
             return
 
         if not self.hid.connected:
@@ -765,6 +911,28 @@ class Session:
                             f"holding input - releasing")
                 self.hid.release_all()
 
+    def _bot_state(self):
+        """Return a short string for the viewer's status overlay, or '' if
+        no bot is running.
+
+        'run'        – FarmBot is actively farming
+        'pause_caps' – paused by the hardware pause key (CapsLock / ScrollLock)
+        'pause'      – paused by viewer manual focus
+        ''           – no bot attached to this sender
+        """
+        if self._bot is None:
+            return ""
+        try:
+            import capslock as _cl
+            reason = _cl.pause_reason()
+            if reason == "key":
+                return "pause_caps"
+            if reason == "viewer":
+                return "pause"
+            return "run"
+        except Exception:
+            return "pause" if self.viewer_manual.is_set() else "run"
+
     def run(self):
         self.cap = Capturer()
         sx, sy, sw, sh = self.cap.screen
@@ -816,6 +984,8 @@ class Session:
             with self._outbox_cv:
                 self._outbox_cv.notify_all()
             self.cap.close()
+            # Viewer disconnected → release manual pause so the bot can resume.
+            self.viewer_manual.clear()
             # Whatever the viewer was holding, let go of it.
             self.hid.release_all()
             self.chan.close()
@@ -851,21 +1021,45 @@ class Session:
                 self._stat_at = wall
                 dropped, self._dropped = self._dropped, 0
                 same, self.cap.unchanged = self.cap.unchanged, 0
-                self.chan.send_json({
+                stat = {
                         "t": "stat",
                         "ms": round(self._build_ms, 1),
                         "kb": round(len(jpeg) / 1024.0, 1),
                         "drop": dropped,
                         "same": same,
-                        # Live, not just at hello: capture can fail over to mss
-                        # mid-session and the label should follow.
                         "cap": self.cap.backend,
                         "lang": keyboard_layout(),
-                    })
+                    }
+                bs = self._bot_state()
+                if bs:
+                    stat["bot"] = bs
+                self.chan.send_json(stat)
+
+
+# ── bot integration ───────────────────────────────────────────────────────────
+def _launch_bot(hid: HidLink, viewer_manual: threading.Event):
+    """Instantiate and start the FarmBot (bot.py) in a background thread.
+
+    FarmBot receives an ArduinoHIDAdapter so it shares the sender's serial port,
+    and the viewer_manual Event so capslock.is_on() / raise_if_on() in the bot
+    automatically yield when the viewer has manual focus on this tile.
+    """
+    try:
+        from bot import FarmBot           # noqa: PLC0415  (same directory)
+    except ImportError as exc:
+        logger.error(f"[BOT] cannot import FarmBot: {exc} — bot not started")
+        return None
+
+    adapter = ArduinoHIDAdapter(hid)
+    bot = FarmBot(shared_arduino=adapter, viewer_manual=viewer_manual)
+    t = threading.Thread(target=bot.run, daemon=True, name="bot-farmbot")
+    t.start()
+    logger.info("[BOT] FarmBot thread started")
+    return bot
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
-def serve(name, port, arduino_port):
+def serve(name, port, arduino_port, run_bot=False):
     warnings = []
     w = pointer_precision_warning()
     if w:
@@ -880,6 +1074,27 @@ def serve(name, port, arduino_port):
     elif not hid.firmware_ok:
         warnings.append("OLD FIRMWARE - flash mouse.ino. Clicks work; "
                         "drag-pan and keystrokes do not.")
+
+    # Best-effort RELEASE_ALL on every possible exit path.
+    # The firmware's own watchdog is the final safety net, but these handlers
+    # cover the common cases before the watchdog timer fires.
+    atexit.register(hid.release_all)
+
+    if sys.platform == "win32":
+        # CTRL_CLOSE_EVENT fires when the user closes the console window.
+        # Python's KeyboardInterrupt does NOT catch it, but SetConsoleCtrlHandler does.
+        import ctypes as _ct
+        _HANDLER = _ct.WINFUNCTYPE(_ct.c_bool, _ct.c_uint)
+        @_HANDLER
+        def _ctrl_handler(event):
+            hid.release_all()
+            return False        # False → let Windows continue its default shutdown
+        _ct.windll.kernel32.SetConsoleCtrlHandler(_ctrl_handler, True)
+
+    # One Event shared by every Session and the bot thread.  The Session sets
+    # it when the viewer takes manual focus; the bot blocks on it immediately.
+    viewer_manual = threading.Event()
+    bot = _launch_bot(hid, viewer_manual) if run_bot else None
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -900,7 +1115,8 @@ def serve(name, port, arduino_port):
                 current.stop.set()
                 current.chan.close()
             logger.info(f"[NET] viewer connected from {addr[0]}:{addr[1]}")
-            current = Session(Channel(sock), hid, name, warnings)
+            current = Session(Channel(sock), hid, name, warnings,
+                              viewer_manual=viewer_manual, bot=bot)
             t = threading.Thread(target=current.run, daemon=True)
             t.start()
     except KeyboardInterrupt:
@@ -908,6 +1124,8 @@ def serve(name, port, arduino_port):
     finally:
         if current is not None:
             current.stop.set()
+        if bot is not None:
+            bot.stop()
         hid.close()
         srv.close()
 
@@ -919,6 +1137,8 @@ def main():
     ap.add_argument("--arduino", default="", help="Arduino COM port, e.g. COM12")
     ap.add_argument("--capture", default="auto", choices=("auto", "dxcam", "mss"),
                     help="force a capture backend instead of preferring dxcam")
+    ap.add_argument("--run-bot", action="store_true",
+                    help="start the FarmBot in-process (shares the Arduino port)")
     args = ap.parse_args()
 
     force_backend(args.capture)
@@ -942,7 +1162,7 @@ def main():
         arduino_port = "COM3"
         logger.warn(f"[HID] no Arduino found, will try {arduino_port}")
 
-    serve(args.name, args.port, arduino_port)
+    serve(args.name, args.port, arduino_port, run_bot=args.run_bot)
 
 
 if __name__ == "__main__":

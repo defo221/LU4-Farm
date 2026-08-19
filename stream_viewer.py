@@ -33,6 +33,7 @@ Controls
 """
 
 import argparse
+import ctypes
 import json
 import os
 import pathlib
@@ -105,9 +106,11 @@ def _load_cur(path):
 _CUR_PATH = pathlib.Path(__file__).with_name("l2cursor.cur")
 _CURSOR_DATA = _load_cur(_CUR_PATH)   # (rgba, hx, hy) or None
 
+
+
 # ── tuning ────────────────────────────────────────────────────────────────────
 IDLE_FPS = 5.0                 # tiles you are not touching
-ACTIVE_FPS = 18.0              # the selected tile; +/- retunes this live
+ACTIVE_FPS = 20.0              # the selected tile; +/- retunes this live
 FPS_LIMITS = (1.0, 30.0)
 UI_HZ = 30                     # redraw rate
 PAN_SEND_HZ = 25               # cap on moverel messages while right-dragging
@@ -132,6 +135,7 @@ KEYSYM_MAP = {
     "space": "space", "Control_L": "ctrl", "Control_R": "rctrl",
     "Alt_L": "alt", "Alt_R": "ralt", "Shift_L": "shift", "Shift_R": "rshift",
     "Super_L": "win", "Super_R": "rwin",
+    "Caps_Lock": "capslock",
     "comma": ",", "period": ".", "slash": "/", "backslash": "\\",
     "semicolon": ";", "apostrophe": "'", "bracketleft": "[",
     "bracketright": "]", "minus": "-", "equal": "=", "grave": "`",
@@ -200,6 +204,8 @@ class SlaveLink:
         self.unchanged = 0        # frames/sec skipped because the screen was still
         self.capture = ""         # slave's capture backend: dxcam | mss
         self.lang = ""            # slave's current keyboard layout: "EN", "RU", …
+        self.bot_state = ""       # "run" | "pause_caps" | "pause" | "" (no bot)
+        self.manual = False       # viewer currently has manual focus on this tile
 
         # what the sender should produce; resent whenever the layout changes
         self.want_scale = 0.34
@@ -284,6 +290,9 @@ class SlaveLink:
             v = obj.get("lang", "")
             if v:
                 self.lang = str(v)
+            bs = obj.get("bot", "")
+            if bs is not None:
+                self.bot_state = str(bs)
         elif t == "error":
             self.note = obj.get("msg", "")
 
@@ -394,9 +403,29 @@ class Viewer:
         self.active_fps = ACTIVE_FPS
 
         self._pan = None              # active right-drag state
+        self._drag_src = None         # tile index where Ctrl+Alt drag started
         self._layout_key = None
         self._alt_held = False        # Alt is down on the viewer keyboard
         self._alt_combo = False       # this Alt hold was used as Alt+digit
+        # In zoom mode the big slot is pinned to self.selected and must not
+        # jump on hover.  hover_idx tracks which tile the mouse is over so it
+        # can receive keyboard input and active FPS without displacing the
+        # big-slot tile.  In grid mode hover_idx is unused (hover == select).
+        self.hover_idx: int | None = None
+        # True while the mouse pointer is physically inside the canvas area.
+        # Used by _update_manual() to decide whether a grid-mode selected tile
+        # counts as "manually focused" (and should pause the bot).
+        self._mouse_on_canvas = False
+        # Foreground-focus tracking: when the viewer loses OS focus all
+        # non-locked tiles drop to idle FPS and manual control is cleared.
+        self._viewer_in_fg = True
+        try:
+            import ctypes as _ct, os as _os
+            self._fg_user32  = _ct.windll.user32
+            self._fg_our_pid = _os.getpid()
+        except Exception:
+            self._fg_user32  = None
+            self._fg_our_pid = None
 
         root.title("PXM fleet viewer")
         root.configure(bg="#101010")
@@ -434,6 +463,7 @@ class Viewer:
     def _bind(self):
         c = self.canvas
         c.bind("<Button-1>", self._on_left_down)
+        c.bind("<ButtonRelease-1>", self._on_left_up)
         c.bind("<Button-2>", self._on_middle_down)
         c.bind("<Button-3>", self._on_right_down)
         c.bind("<B3-Motion>", self._on_right_motion)
@@ -450,6 +480,12 @@ class Viewer:
         # Alt+digit combos missing on the first attempt.
         self.root.bind("<Alt_L>", self._on_alt_down)
         self.root.bind("<Alt_R>", self._on_alt_down)
+        # CapsLock cannot be captured via Tkinter bindings on Windows — the OS
+        # processes it as a modifier-state change before the event reaches the
+        # app.  Instead a background thread polls the viewer PC's toggle state
+        # and forwards any change to the slave while our window is in focus.
+        threading.Thread(target=self._caps_lock_monitor,
+                         daemon=True, name="caps-monitor").start()
         # Explicit Alt+digit bindings so they are captured even when Tkinter's
         # window-menu system would otherwise swallow the Alt prefix on Windows.
         for d in "0123456789":
@@ -469,12 +505,11 @@ class Viewer:
             return
         self._layout_key = key
 
-        if self.zoomed and self.selected is not None:
-            for i, t in enumerate(self.tiles):
-                t.rect = (0, 0, w, h) if i == self.selected else (0, 0, 0, 0)
-                if i != self.selected:
-                    t.shown = None
+        n = len(self.tiles)
+        if n <= 9:
+            self._layout_special(w, h)
         else:
+            # Legacy uniform grid for more than 9 tiles.
             cw, ch = w // self.cols, h // self.rows
             for i, t in enumerate(self.tiles):
                 col, row = i % self.cols, i // self.cols
@@ -485,12 +520,156 @@ class Viewer:
             if t.rect[2] > 0:
                 t.link.set_scale_for(t.rect[2] - 2 * TILE_BORDER)
 
+    def _layout_special(self, w, h):
+        """Layout for up to 8 tiles (7 game + 1 controls ★).
+
+        Grid mode  — 3×3 uniform grid; tiles 0-6 fill left-to-right /
+                     top-to-bottom; tile 7 (★) sits at (row 2, col 1);
+                     cell (row 2, col 2) is always empty.
+
+            ┌──────┬──────┬──────┐
+            │  0   │  1   │  2   │
+            ├──────┼──────┼──────┤
+            │  3   │  4   │  5   │
+            ├──────┼──────┼──────┤
+            │  6   │  7★  │      │
+            └──────┴──────┴──────┘
+
+        Zoom mode  — 4×4-derived layout: the selected tile occupies the
+                     top-left ¾×¾ of the canvas; remaining game tiles fill
+                     the right column (3 slots, T→B) then the bottom row
+                     (3 slots, L→R); tile 7 (★) is always pinned to the
+                     bottom-right corner.
+
+            ┌──────────────────┬──────┐
+            │                  │ r[0] │
+            │    selected      ├──────┤
+            │    (¾W × ¾H)    │ r[1] │
+            │                  ├──────┤
+            │                  │ r[2] │
+            ├──────┬──────┬────┼──────┤
+            │ r[3] │ r[4] │r[5]│  7★  │
+            └──────┴──────┴────┴──────┘
+              ¼W    ¼W    ¼W    ¼W
+
+            r[0..5] = remaining game tiles in natural index order.
+        """
+        n = len(self.tiles)
+        # Tile 7 is the controls slot only when there are exactly 8 tiles.
+        # With 9 tiles every slot is a game tile; with ≤7 there is no controls tile.
+        controls_idx = 7 if n == 8 else None
+
+        if self.zoomed and self.selected is not None:
+            # ── Zoom layout ───────────────────────────────────────────────
+            sw = w // 4           # small-cell width  (¼ of canvas)
+            sh = h // 4           # small-cell height (¼ of canvas)
+            bw = w - sw           # big-cell width    (exact ¾, avoids rounding gap)
+            bh = h - sh           # big-cell height   (exact ¾)
+
+            # Small-slot (x, y) positions:
+            # right column T→B first (tiles 2-4), then bottom row L→R (tiles 5-7).
+            small_slots = [
+                (w - sw,  0),          # right-top         → PC-2
+                (w - sw,  sh),         # right-middle       → PC-3
+                (w - sw,  2 * sh),     # right-bottom       → PC-4
+                (0,       h - sh),    # bottom-left        → PC-5
+                (sw,      h - sh),    # bottom-center-left → PC-6
+                (2 * sw,  h - sh),    # bottom-center-right→ PC-7
+            ]
+
+            sel = self.selected
+            remaining = [i for i in range(n) if i != sel and i != controls_idx]
+
+            # Reset all rects first so nothing stale lingers.
+            for t in self.tiles:
+                t.rect = (0, 0, 0, 0)
+                t.shown = None
+
+            # Big tile.
+            self.tiles[sel].rect = (0, 0, bw, bh)
+
+            # Remaining game tiles → small slots in order.
+            for slot, tile_idx in enumerate(remaining):
+                if slot < len(small_slots):
+                    sx, sy = small_slots[slot]
+                    self.tiles[tile_idx].rect = (sx, sy, sw, sh)
+
+            # Controls tile pinned to bottom-right corner.
+            if controls_idx is not None:
+                self.tiles[controls_idx].rect = (w - sw, h - sh, sw, sh)
+
+        else:
+            # ── Grid layout: 3×3 ─────────────────────────────────────────
+            # (row, col) for each tile index 0-7.
+            GRID_POS = [
+                (0, 0), (0, 1), (0, 2),   # tiles 0-2
+                (1, 0), (1, 1), (1, 2),   # tiles 3-5
+                (2, 0), (2, 1), (2, 2),   # tiles 6, 7 ★, 8  (all 9 cells used)
+                # With ≤8 tiles the last cell(s) are simply not assigned.
+            ]
+
+            cw = w // 3
+            ch = h // 3
+            # Distribute any rounding remainder to the last column / row.
+            col_w = [cw, cw, w - 2 * cw]
+            row_h = [ch, ch, h - 2 * ch]
+            col_x = [0, cw, 2 * cw]
+            row_y = [0, ch, 2 * ch]
+
+            for i, t in enumerate(self.tiles):
+                if i < len(GRID_POS):
+                    r, c = GRID_POS[i]
+                    t.rect = (col_x[c], row_y[r], col_w[c], row_h[r])
+                else:
+                    t.rect = (0, 0, 0, 0)
+                    t.shown = None
+
+    # ---- foreground-focus helpers ----
+    def _is_viewer_foreground(self) -> bool:
+        """Return True if any window owned by this process is the foreground window."""
+        if self._fg_user32 is None:
+            return True
+        try:
+            import ctypes
+            fg_pid = ctypes.c_ulong(0)
+            self._fg_user32.GetWindowThreadProcessId(
+                self._fg_user32.GetForegroundWindow(), ctypes.byref(fg_pid))
+            return fg_pid.value == self._fg_our_pid
+        except Exception:
+            return True
+
+    def _on_viewer_blur(self):
+        """Called once when the viewer loses OS foreground focus.
+
+        Drops every non-locked tile back to idle FPS and clears hover/manual
+        state so the bot can resume and slaves don't keep streaming at full
+        rate while the viewer is in the background.
+        """
+        self._mouse_on_canvas = False
+        self._set_hover(None)
+        # In grid mode the selected tile is normally kept at active FPS; drop
+        # it to idle too since the user is no longer watching this viewer.
+        if not self.zoomed and self.selected is not None:
+            t = self.tiles[self.selected]
+            if not t.fps_locked:
+                t.link.set_active(False)
+        self._layout_key = None     # force border colour refresh
+
     # ---- draw ----
     def _tick(self):
         try:
+            # Detect OS foreground focus changes once per tick (~10 Hz).
+            # When the viewer goes to the background all non-locked tiles drop
+            # to idle; when it comes back normal hover/selection takes over.
+            in_fg = self._is_viewer_foreground()
+            if not in_fg and self._viewer_in_fg:
+                self._on_viewer_blur()
+            self._viewer_in_fg = in_fg
+
             self._layout()
             self._draw()
             self._update_status()
+            self._update_manual()
             # Keep the L2 cursor on top of all tile content after every redraw.
             if self._cur_id is not None:
                 self.canvas.tag_raise(self._cur_id)
@@ -498,7 +677,34 @@ class Viewer:
             print(f"[UI] {e}", file=sys.stderr)
         self.root.after(int(1000 / UI_HZ), self._tick)
 
+    def _update_manual(self):
+        """Tell each sender whether the viewer currently has manual focus on it.
+
+        Sends {"t": "manual", "v": bool} only when the state actually changes
+        so the wire stays quiet during normal idle periods.
+
+        A tile is "manually controlled" when:
+          • zoom mode  – cursor is physically hovering over it (hover_idx == i)
+          • grid mode  – it is selected AND the mouse is inside the canvas
+          • either mode – it is MMB-locked to max FPS (fps_locked)
+        """
+        for i, t in enumerate(self.tiles):
+            if self.zoomed:
+                hover = (i == self.hover_idx)
+            else:
+                hover = (i == self.selected) and self._mouse_on_canvas
+            want = hover or t.fps_locked
+            if want != t.link.manual:
+                t.link.manual = want
+                t.link.send({"t": "manual", "v": want})
+
     def _draw(self):
+        # In zoom mode, the blue border tracks the hovered tile (keyboard target).
+        # When nothing is hovered the big selected tile keeps the blue border.
+        effective_active = (self.hover_idx
+                            if (self.zoomed and self.hover_idx is not None)
+                            else self.selected)
+
         for i, t in enumerate(self.tiles):
             bx, by, bw, bh = t.rect
             if bw <= 0 or bh <= 0:
@@ -510,7 +716,7 @@ class Viewer:
                 continue
 
             selected = (i == self.selected)
-            colour = "#3fa7ff" if (selected or t.fps_locked) else "#303030"
+            colour = "#3fa7ff" if (i == effective_active or t.fps_locked) else "#303030"
             if t.border_id is None:
                 t.border_id = self.canvas.create_rectangle(0, 0, 0, 0, width=TILE_BORDER)
             self.canvas.coords(t.border_id, bx + 1, by + 1, bx + bw - 1, by + bh - 1)
@@ -521,8 +727,9 @@ class Viewer:
 
     def _draw_frame(self, t, bx, by, bw, bh):
         got = t.link.frame
+        # Image fills the full inner tile; the status label overlays on top.
         inner_w = bw - 2 * TILE_BORDER
-        inner_h = bh - 2 * TILE_BORDER - LABEL_H
+        inner_h = bh - 2 * TILE_BORDER
         if got is None or inner_w <= 0 or inner_h <= 0:
             if t.img_id:
                 self.canvas.itemconfigure(t.img_id, state="hidden")
@@ -535,7 +742,7 @@ class Viewer:
         k = min(inner_w / sw, inner_h / sh)
         dw, dh = max(int(sw * k), 1), max(int(sh * k), 1)
         ox = bx + TILE_BORDER + (inner_w - dw) // 2
-        oy = by + TILE_BORDER + LABEL_H + (inner_h - dh) // 2
+        oy = by + TILE_BORDER + (inner_h - dh) // 2
 
         unchanged = (t.seq == t.link.frame_seq and t.shown
                      and t.shown[1:] == (ox, oy, dw, dh))
@@ -546,6 +753,16 @@ class Viewer:
         if (dw, dh) != (sw, sh):
             interp = cv2.INTER_AREA if dw < sw else cv2.INTER_LINEAR
             rgb = cv2.resize(rgb, (dw, dh), interpolation=interp)
+
+        # Dark semi-transparent strip for the status overlay.  We darken the
+        # top rows of the decoded frame (copy first so the link's cache is not
+        # mutated).  alpha=0.30 keeps 30% of the original brightness → the
+        # strip looks like a ~70% opaque dark grey glass pane.
+        strip_h = min(LABEL_H + TILE_BORDER, dh)
+        if strip_h > 0:
+            rgb = rgb.copy()
+            rgb[:strip_h] = (rgb[:strip_h] * 0.75).astype(rgb.dtype)
+
         img = Image.fromarray(rgb)
 
         # Reusing the PhotoImage buffer avoids reallocating 9 of them per redraw.
@@ -568,13 +785,14 @@ class Viewer:
         bits = [link.name, link.status]
         if link.status == "online":
             bits.append(f"{link.fps_seen:4.1f}fps")
-            if link.build_ms > 0:
-                # ms per frame x frames per second / 10 = percent of one core.
-                # This is the number that says whether the rate can go higher.
-                core = link.build_ms * link.fps_seen / 10.0
-                bits.append(f"{link.build_ms:.0f}ms {core:.0f}%core")
             if link.dropped:
                 bits.append(f"-{link.dropped}/s")
+            if link.bot_state == "run":
+                bits.append("[BOT]")
+            elif link.bot_state == "pause_caps":
+                bits.append("[PAUSED (CAPS)]")
+            elif link.bot_state == "pause":
+                bits.append("[PAUSED]")
             if link.lang:
                 bits.append(f"[{link.lang}]")
             if link.capture == "mss":
@@ -595,12 +813,24 @@ class Viewer:
         self.canvas.coords(t.text_id, bx + TILE_BORDER + 3, by + TILE_BORDER + 2)
         self.canvas.itemconfigure(t.text_id, text=text, fill=fg, state="normal")
 
+        # Layer order: game image (with darkened top strip) → text → border.
+        self.canvas.tag_raise(t.text_id)
+        if t.border_id:
+            self.canvas.tag_raise(t.border_id)
+
     # ---- viewer cursor (L2 art, follows viewer mouse) ----
     def _on_mouse_move(self, event):
-        # Hover-to-select: entering a tile activates it immediately.
+        self._mouse_on_canvas = True
         idx = self._tile_at(event.x, event.y)
-        if idx is not None and idx != self.selected:
-            self._select(idx)
+
+        if self.zoomed:
+            # Zoom mode: big slot is pinned to self.selected — never swap it on
+            # hover.  Just track hover_idx for FPS boost and keyboard routing.
+            self._set_hover(idx)
+        else:
+            # Grid mode: hover immediately activates the tile (select = hover).
+            if idx is not None and idx != self.selected:
+                self._select(idx)
 
         if self._cur_id is None:
             return
@@ -610,7 +840,30 @@ class Viewer:
         self.canvas.itemconfigure(self._cur_id, state="normal")
         self.canvas.tag_raise(self._cur_id)
 
+    def _set_hover(self, idx):
+        """Update hover target in zoom mode without touching the big-slot tile.
+
+        Gives the hovered tile active FPS and keyboard routing; drops the
+        previous hover tile back to idle (unless it is selected or fps_locked).
+        """
+        old = self.hover_idx
+        if old == idx:
+            return
+        self.hover_idx = idx
+        if old is not None:
+            old_t = self.tiles[old]
+            self._release_keys(old_t.link)
+            if not old_t.fps_locked:
+                # In zoom mode FPS is fully hover-driven: even the big selected
+                # tile drops to idle when the mouse leaves it.
+                old_t.link.set_active(False)
+        if idx is not None:
+            self.tiles[idx].link.set_active(True, self.active_fps)
+
     def _on_mouse_leave(self, event):
+        self._mouse_on_canvas = False
+        if self.zoomed:
+            self._set_hover(None)   # drop FPS boost on the tile we just left
         if self._cur_id is not None:
             self.canvas.itemconfigure(self._cur_id, state="hidden")
 
@@ -638,11 +891,13 @@ class Viewer:
         if self.selected is not None:
             old_tile = self.tiles[self.selected]
             self._release_keys(old_tile.link)
-            # Keep locked tiles at active FPS even when deselected.
             if not old_tile.fps_locked:
                 old_tile.link.set_active(False)
         self.selected = idx
-        if idx is not None:
+        if idx is not None and not self.zoomed:
+            # In zoom mode FPS is driven entirely by hover_idx, not selection.
+            # Activating the big slot here would leave it stuck at active FPS
+            # even when the mouse is nowhere near it.
             self.tiles[idx].link.set_active(True, self.active_fps)
         self._layout_key = None       # border colour + zoom target changed
 
@@ -651,8 +906,23 @@ class Viewer:
         idx = self._tile_at(event.x, event.y)
         if idx is None:
             return
-        # First click on a tile only focuses it. Prevents a stray click in the
-        # grid from landing in a live game window.
+        # Ctrl+Alt held: start a drag-to-swap gesture.  The swap fires on
+        # ButtonRelease so the user can drag visually to the destination tile.
+        ctrl = bool(event.state & 0x4)
+        alt  = bool(event.state & 0x20000)  # Mod1 on Windows = Alt
+        if ctrl and alt:
+            self._drag_src = idx
+            return
+        if self.zoomed:
+            # Zoom mode: forward click to whichever tile was clicked, no layout
+            # swap.  _set_hover routes keyboard/FPS to that tile.
+            self._set_hover(idx)
+            t = self.tiles[idx]
+            pos = t.canvas_to_slave(event.x, event.y)
+            if pos is not None:
+                t.link.send({"t": "click", "x": pos[0], "y": pos[1], "btn": "left"})
+            return
+        # Grid mode: first click focuses the tile; subsequent clicks act.
         if idx != self.selected:
             self._select(idx)
             return
@@ -662,6 +932,28 @@ class Viewer:
             return
         t.link.send({"t": "click", "x": pos[0], "y": pos[1], "btn": "left"})
 
+    def _on_left_up(self, event):
+        """Complete a Ctrl+Alt drag-to-swap gesture."""
+        src = self._drag_src
+        self._drag_src = None
+        if src is None:
+            return
+        dst = self._tile_at(event.x, event.y)
+        if dst is None or dst == src:
+            return
+        # Swap the two tiles' links (and all per-tile state).
+        a, b = self.tiles[src], self.tiles[dst]
+        a.link, b.link = b.link, a.link
+        a.fps_locked, b.fps_locked = b.fps_locked, a.fps_locked
+        # If either tile was selected, update the selection index.
+        if self.selected == src:
+            self.selected = dst
+        elif self.selected == dst:
+            self.selected = src
+        # Reset hover so FPS state is re-evaluated on next mouse-move.
+        self.hover_idx = None
+        self._layout_key = None
+
     def _on_middle_down(self, event):
         """Toggle per-tile max-FPS lock.  Never forwarded to the slave."""
         idx = self._tile_at(event.x, event.y)
@@ -670,20 +962,29 @@ class Viewer:
         t = self.tiles[idx]
         t.fps_locked = not t.fps_locked
         if t.fps_locked:
-            # Immediately run at active FPS regardless of whether it is selected.
             t.link.set_active(True, self.active_fps)
-        elif idx != self.selected:
-            # Unlocked and not the hovered tile → drop back to idle.
-            t.link.set_active(False)
-        # If unlocked but still selected, hover-based logic keeps it active.
+        else:
+            # Unlocked: drop to idle unless it is currently the active tile.
+            # In zoom mode "active" means hovered; in grid mode it means selected.
+            currently_active = (
+                (self.zoomed     and idx == self.hover_idx) or
+                (not self.zoomed and idx == self.selected)
+            )
+            if not currently_active:
+                t.link.set_active(False)
         self._layout_key = None        # force border colour refresh
         return "break"
 
     def _on_right_down(self, event):
         idx = self._tile_at(event.x, event.y)
-        if idx is None or idx != self.selected:
-            if idx is not None:
-                self._select(idx)
+        if idx is None:
+            return
+        if self.zoomed:
+            # Zoom mode: start pan on whatever tile was right-clicked.
+            self._set_hover(idx)
+        elif idx != self.selected:
+            # Grid mode: first right-click focuses the tile, no pan yet.
+            self._select(idx)
             return
         t = self.tiles[idx]
         pos = t.canvas_to_slave(event.x, event.y)
@@ -748,7 +1049,11 @@ class Viewer:
 
     def _on_wheel(self, event):
         idx = self._tile_at(event.x, event.y)
-        if idx is None or idx != self.selected:
+        if idx is None:
+            return
+        # In zoom mode scroll works on any tile under the cursor; in grid mode
+        # only the selected (focused) tile receives scroll events.
+        if not self.zoomed and idx != self.selected:
             return
         t = self.tiles[idx]
         pos = t.canvas_to_slave(event.x, event.y)
@@ -799,6 +1104,50 @@ class Viewer:
         self.held_keys.add("alt")
         link.send({"t": "kdown", "key": "alt"})
 
+    def _caps_lock_monitor(self):
+        """Background thread: forward CapsLock toggles to the active slave.
+
+        Tkinter on Windows never fires <Caps_Lock> KeyPress events because the
+        OS toggles the key state before the message even reaches the app.  This
+        thread polls the physical key state (bit 0x8000 of GetAsyncKeyState) at
+        10 ms intervals and, on each rising edge while the viewer process owns
+        the foreground window, sends a kdown+kup tap to the currently active
+        slave — one tap per physical press, reliably.
+
+        We compare process IDs rather than window handles because
+        GetForegroundWindow() returns the focused child widget's HWND (e.g. the
+        canvas), which differs from self.root.winfo_id() — a handle comparison
+        would always fail and every toggle would be silently dropped.
+        """
+        import ctypes
+        import os
+        user32   = ctypes.windll.user32
+        VK_CAPS  = 0x14
+        our_pid  = os.getpid()
+        # Detect the physical rising edge (not-pressed → pressed) using bit
+        # 0x8000.  Do NOT use bit 0x0001 — for GetAsyncKeyState that bit means
+        # "pressed since last call to GetAsyncKeyState" (resets on each call),
+        # NOT the toggle state, causing erratic double-fires.
+        was_down = bool(user32.GetAsyncKeyState(VK_CAPS) & 0x8000)
+        while True:
+            time.sleep(0.01)          # 10 ms — fast enough to catch quick taps
+            is_down = bool(user32.GetAsyncKeyState(VK_CAPS) & 0x8000)
+            if is_down == was_down:
+                continue
+            was_down = is_down
+            if not is_down:
+                continue              # falling edge (key released) — ignore
+            # Rising edge: CapsLock physically pressed.
+            fg_pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(
+                user32.GetForegroundWindow(), ctypes.byref(fg_pid))
+            if fg_pid.value != our_pid:
+                continue
+            link = self._selected_link()
+            if link is not None:
+                link.send({"t": "kdown", "key": "capslock"})
+                link.send({"t": "kup",   "key": "capslock"})
+
     def _on_alt_down(self, event):
         """Dedicated Alt_L / Alt_R handler.
 
@@ -848,6 +1197,17 @@ class Viewer:
         if ks == "grave" or event.keycode == 192:
             self.zoomed = not self.zoomed
             self._layout_key = None
+            if self.zoomed:
+                # Entering zoom mode: FPS is now hover-driven.  Drop the selected
+                # tile to idle — _set_hover will re-activate it on first mouse-move.
+                if self.selected is not None:
+                    t = self.tiles[self.selected]
+                    if not t.fps_locked:
+                        t.link.set_active(False)
+            else:
+                # Leaving zoom mode: discard hover state; next mouse-move
+                # re-activates via the grid-mode select path.
+                self._set_hover(None)
             return "break"
 
         # +/- retune the active-tile frame rate.
@@ -918,9 +1278,16 @@ class Viewer:
                 t.link.set_active(True, self.active_fps)
 
     def _selected_link(self):
-        if self.selected is None:
-            return None
-        return self.tiles[self.selected].link
+        """Slave that currently owns keyboard input and FPS boost.
+
+        In zoom mode this is the hovered tile (if any), otherwise the big-slot
+        tile.  In grid mode hover == select so self.selected is always correct.
+        """
+        if self.zoomed and self.hover_idx is not None:
+            return self.tiles[self.hover_idx].link
+        if self.selected is not None:
+            return self.tiles[self.selected].link
+        return None
 
     def _release_keys(self, link):
         if link is None:
@@ -941,8 +1308,14 @@ class Viewer:
         n = len(self.tiles)
         if n == 0:
             return
-        start = 0 if self.selected is None else (self.selected + step) % n
-        self._select(start)
+        # With exactly 8 tiles, index 7 is the controls slot — skip it.
+        # With any other count every tile is a game window.
+        game_n = 7 if n == 8 else n
+        if game_n == 0:
+            return
+        start = 0 if self.selected is None else self.selected
+        nxt = (start + step) % game_n
+        self._select(nxt)
 
     def shutdown(self):
         self._panic()

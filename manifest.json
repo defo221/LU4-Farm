@@ -1,7 +1,7 @@
 {
   "bot.py": {
-    "sha256": "e39905172acd5b034ffd6fe4d0257b290bb8158acd7aeb19258885ff22348624",
-    "size": 88644
+    "sha256": "54c48083fae35c8180a692cb62d4a309395ac66f4e84a882021152c1a99a02a2",
+    "size": 89141
   },
   "hotkey_assist.py": {
     "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
@@ -28,8 +28,8 @@
     "size": 5777
   },
   "capslock.py": {
-    "sha256": "1a3d81939ccb2a24c4e13397732141d3c69ace93dd1649f384e5678933e52228",
-    "size": 2483
+    "sha256": "193fb40114fcd0f02df18456dc5d63002e415babca3aa38a44c6b32d759a8863",
+    "size": 3901
   },
   "hp_monitor.py": {
     "sha256": "301878d96ce229814f6f0052a62aa1dc222f130bbb4eadadd95144b1ff4f7b84",
@@ -92,12 +92,12 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "44f703e3df3423e18274401ffbcaf75e5985d93de4715899e483b5f3c830b2a5",
-    "size": 37699
+    "sha256": "4090563ab7ba3eb4e9e41485034696fe5fbe40238769dd78447144482b18c45c",
+    "size": 47106
   },
   "stream_viewer.py": {
-    "sha256": "8e6ce7ad935f6e19d30768a4340abe17071cba94a966abdcd200fce91007bab9",
-    "size": 40471
+    "sha256": "2de350658abd91ee7a88034029608f9fe120bbddc355f700e4fd168f5571a8a3",
+    "size": 57751
   },
   "bench_capture.py": {
     "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
@@ -120,8 +120,8 @@
     "size": 2235
   },
   "mouse.ino": {
-    "sha256": "fb4b76d7aaf97fef3975952542bb67cd8e0061c5a1c3d995767a1d3e2b5be4f0",
-    "size": 14408
+    "sha256": "ae9bf4d36d4c02bc497b1a5308e6bca19c0664dd8df352ebde4248bce124d752",
+    "size": 15787
   },
   "l2cursor.cur": {
     "sha256": "54cb10aff82f637f159577a3c37c5e658dc1f4d03ca441f9ef12a2d726810735",
@@ -180,8 +180,8 @@
     "size": 4537
   },
   "assets/fullhd/party_pl_anchor.png": {
-    "sha256": "db2ac25c17825d1905c667975cbf53eb59128cb80e5a76f4c168766956b26cd0",
-    "size": 468
+    "sha256": "7f2bb0d24215019077ecee79e04c5268751e263804d9e4288df7dd9ce459c407",
+    "size": 519
   },
   "assets/fullhd_small/bag_mob_anchor.png": {
     "sha256": "1bfecb9d9b18404d17aeb1413a6410be660aa1afc57cd0a7b62a7b141014d750",
@@ -211,21 +211,9 @@
     "sha256": "368ac8bdb8bede1d244e76275a1e6a50083af056e1f50ce122c599df64894d53",
     "size": 1347
   },
-  "assets/mob_skip.png": {
-    "sha256": "4ec6cf5ef05fa018b42c6ca645db4014d9a14523779c00252d70ccd7f425da59",
-    "size": 8907
-  },
-  "assets/mob_skip1.png": {
-    "sha256": "9c9147d8c66956088b3cce9102175b23e573b72b244f6ced2d290e1dc394d3e1",
-    "size": 9500
-  },
   "assets/mob_skip2.png": {
     "sha256": "34c07741b967e1e97da2c3cf1448cab8fe4428e624cf2b302cad29f0cd1804c9",
     "size": 1081
-  },
-  "assets/mob_skip3.png": {
-    "sha256": "f19d0fdc780a0bb098a98b6d2efa58ac2dd965f65ec71d5845806a8ef40d2df0",
-    "size": 9280
   },
   "assets/party_pl_anchor.png": {
     "sha256": "db2ac25c17825d1905c667975cbf53eb59128cb80e5a76f4c168766956b26cd0",

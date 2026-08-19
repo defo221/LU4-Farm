@@ -48,6 +48,26 @@
 
 static bool shouldStop = false;
 
+// ---- stuck-key watchdog ----------------------------------------------------
+// g_anythingHeld is set whenever a MOUSE_DOWN or KEY_DOWN command is received
+// and cleared by RELEASE_ALL or by the watchdog itself.
+// Two complementary triggers:
+//   1. !Serial  – the host closed (or crashed on) the virtual COM port; fire
+//                 immediately so keys don't stay stuck after sender exits.
+//   2. timer    – if holds go silent for WATCHDOG_MS the firmware self-heals,
+//                 even when the port stays open (e.g. TCP drop, Python freeze).
+static bool          g_anythingHeld = false;
+static unsigned long g_lastCmdMs    = 0;
+static const unsigned long WATCHDOG_MS = 4000;  // 4 s without a command
+
+static void releaseEverything() {
+  Keyboard.releaseAll();
+  Mouse.release(MOUSE_LEFT);
+  Mouse.release(MOUSE_RIGHT);
+  Mouse.release(MOUSE_MIDDLE);
+  g_anythingHeld = false;
+}
+
 // Pixels emitted per HID report during a stepped move. Mouse.move() takes a
 // signed char, so 127 is the hard ceiling. Small values look smoother but make
 // long moves slow (each step costs one ~1 ms USB frame); remote control wants 25-50.
@@ -108,6 +128,7 @@ static uint8_t nameToKeyCode(const String& raw) {
   if (name == "rshift")                         return KEY_RIGHT_SHIFT;
   if (name == "gui" || name == "win" || name == "lwin") return KEY_LEFT_GUI;
   if (name == "rwin")                           return KEY_RIGHT_GUI;
+  if (name == "capslock" || name == "caps_lock") return KEY_CAPS_LOCK;
   if (name == "space")                          return ' ';
   if (name.length() == 1)                       return (uint8_t)name[0];
   return 0;
@@ -188,11 +209,22 @@ static long argAfterComma(const String& s, int which) {
 }
 
 void loop() {
+  // ---- stuck-key watchdog ----
+  // Trigger 1: host closed the virtual COM port (process killed / console closed).
+  // Trigger 2: timer – something was held but no command for WATCHDOG_MS ms.
+  if (g_anythingHeld) {
+    if (!Serial || (millis() - g_lastCmdMs) > WATCHDOG_MS) {
+      releaseEverything();
+      g_lastCmdMs = millis();
+    }
+  }
+
   if (!Serial.available()) return;
 
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
   if (cmd.length() == 0) return;
+  g_lastCmdMs = millis();  // any command resets the silence timer
 
   if (cmd.startsWith("MOVE")) {
     shouldStop = false;
@@ -338,6 +370,7 @@ void loop() {
     uint8_t btn = nameToMouseButton(strAfterComma(cmd, 1));
     if (btn == 0) { Serial.println(0); return; }
     Mouse.press(btn);
+    g_anythingHeld = true;
     Serial.println(1);
   }
   // MOUSE_UP,<btn>
@@ -352,6 +385,7 @@ void loop() {
     uint8_t code = nameToKeyCode(strAfterComma(cmd, 1));
     if (code == 0) { Serial.println(0); return; }
     Keyboard.press(code);
+    g_anythingHeld = true;
     Serial.println(1);
   }
   // KEY_UP,<name>
@@ -373,10 +407,7 @@ void loop() {
     Serial.println(1);
   }
   else if (cmd.equalsIgnoreCase("RELEASE_ALL")) {
-    Keyboard.releaseAll();
-    Mouse.release(MOUSE_LEFT);
-    Mouse.release(MOUSE_RIGHT);
-    Mouse.release(MOUSE_MIDDLE);
+    releaseEverything();
     Serial.println(1);
   }
 }
