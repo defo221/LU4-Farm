@@ -188,13 +188,19 @@ HP_STALL_S   =  8     # if mob HP has not dropped below HP_STALL_PCT within this
 HP_STALL_PCT = 99.5   # HP% treated as "not yet damaged"
 HP_STALL_JITTER_MIN = 0   # random extra wait (seconds) before the stall action fires,
 HP_STALL_JITTER_MAX = 3   # so multiple characters don't all react at the exact same time
+# Single-window assist stall: wait after the LMB burst before restarting Phase 1
+SA_STALL_WAIT_MIN      = 3    # seconds
+SA_STALL_WAIT_MAX      = 6
+# Interval between F5 presses in the recovery F5 loop.
+# During this gap the bot runs buff/death/party-anchor checks.
+SA_F5_LOOP_INTERVAL_S  = 5.0  # seconds
 
 HP_ANCHOR_MISS_LIMIT = 2   # consecutive checks without bag_mob_anchor → restart cycle
 
 # ---------------------------------------------------------------------------
 # Mob death monitoring
 # ---------------------------------------------------------------------------
-DEATH_CHECK_INTERVAL = 0.2   # seconds between mob_dead image checks
+DEATH_CHECK_INTERVAL = 0.03   # seconds between mob_dead image checks
 DEATH_SWITCH_EVERY   = 5
 DEATH_TIMEOUT        = 15.0  # seconds before "waited too long to die" handling
 
@@ -203,6 +209,7 @@ DEATH_TIMEOUT        = 15.0  # seconds before "waited too long to die" handling
 # ---------------------------------------------------------------------------
 ANCHOR_CONFIDENCE         = 0.80  # matchTemplate threshold for all anchors
 PARTY_ANCHOR_CONFIDENCE   = 0.75  # lower threshold for party_pl_anchor — template varies across machines
+DC_CONFIDENCE             = 0.80  # matchTemplate threshold for disconnect.png
 ANCHOR_CACHE_PADDING = 90    # px padding around cached anchor for fast re-verify
 # bag_mob_anchor and char_bars_anchor are only searched within the top
 # ANCHOR_TOP_REGION_PX rows of the screen (full-screen search only; cached
@@ -255,6 +262,63 @@ ASSIST_ATTACK_HOLD_MIN_MS        =  60    # hold duration per press (ms)
 ASSIST_ATTACK_HOLD_MAX_MS        = 120
 ASSIST_ATTACK_INTERVAL_MIN_MS    =  60    # gap between consecutive presses (ms)
 ASSIST_ATTACK_INTERVAL_MAX_MS    = 100
+
+# ---------------------------------------------------------------------------
+# Single-window assist — phase-based target acquisition (SA_*)
+# ---------------------------------------------------------------------------
+# Phase 1: single RMB click at assist_point, wait, check bag_mob_anchor
+SA_RMB_ATTEMPTS      =    3    # RMB clicks per normal-mode attempt
+SA_RMB_WAIT_MS       =  400    # ms to wait after each RMB before checking
+
+# Phase 2: press F5, wait, check bag_mob_anchor
+SA_F5_ATTEMPTS       =    1    # F5 presses per normal-mode attempt
+SA_F5_WAIT_MS        =  400    # ms to wait after each F5 before checking
+
+# Phase 3: healer-area fallback when both phases 1 & 2 failed
+SA_HEALER_CLICK_AREA      =  200    # side (px) of the click area centred on healer_farm_anchor
+SA_HEALER_PRE_DELAY_MAX   =  3.0    # random 0..N second pause before starting clicks (s)
+SA_HEALER_POST_PAUSE_MIN  =  5.0    # pause after last click before F5 loop starts (s)
+SA_HEALER_POST_PAUSE_MAX  = 10.0
+SA_HEALER_CLICK_PROX_MIN  =   75    # each click ≥ this many px from the previous one
+SA_HEALER_CLICK_PROX_MAX  =  150    # each click ≤ this many px from the previous one
+# Perspective-aware vertical bounds
+SA_HEALER_UPPER_EXTEND    =   50    # max px ABOVE healer when it is in the upper screen half
+SA_HEALER_LOWER_EXTEND    =  150    # max px BELOW healer when it is in the lower screen half
+# Exclusion zone directly below the healer centre (applied on every click)
+SA_HEALER_EXCL_W          =   30    # width  of the below-healer exclusion zone (px)
+SA_HEALER_EXCL_H          =   60    # height of the below-healer exclusion zone (px)
+SA_CAMERA_ROTATE_DX       =  550    # horizontal drag distance for a 180° camera rotation
+# No-healer fallback (used when healer_farm_anchor is not found even after rotation)
+SA_FALLBACK_DELAY_MAX     =  3.0    # random 0..N s delay before fallback clicks (s)
+SA_FALLBACK_CLICK_AREA    =  200    # side (px) of the centered clickable square
+SA_FALLBACK_EXCL_W        =   40    # width  of centre exclusion zone for 1st click
+SA_FALLBACK_EXCL_H        =   80    # height of centre exclusion zone for 1st click
+SA_FALLBACK_CLICK2_GAP_MAX=  500    # max ms between 1st and 2nd fallback click
+SA_FALLBACK_CLICK_PROX_MIN=   50    # min px distance between the two fallback clicks
+SA_FALLBACK_CLICK_PROX_MAX=  100    # max px distance between the two fallback clicks
+
+# Phase 4: approach via double-clicks when in_target_blue is too far from center
+SA_APPROACH_PX             =  200   # distance threshold (px) — closer → attack immediately
+SA_APPROACH_MAX_DCLK       =    4   # max double-clicks before attacking anyway
+# Downward corridor bias that compensates for the isometric perspective.
+# When the mob is at 3/9 o'clock the blue dots sit above the mob's ground
+# position; shifting the corridor target down brings clicks closer to the
+# actual body.  Scales with abs(sin(angle_from_vertical)) = |ux|:
+#   12/6 o'clock → 0 px offset
+#   3/9  o'clock → SA_APPROACH_DOWN_OFFSET_MAX px offset
+SA_APPROACH_DOWN_OFFSET_MAX =   40   # px — tune to your camera angle
+SA_CORRIDOR_W        =    80    # perpendicular spread of the click corridor (px).
+                               # 0 = click exactly along the line from screen center
+                               # to mob — recommended for isometric games where
+                               # vertical offset maps to 3D depth, not sideways movement.
+# Delays between consecutive double-clicks (uniform random, ms)
+SA_DCLK_DELAY_1_MAX  = 3000    # between 1st and 2nd double-click
+SA_DCLK_DELAY_2_MAX  = 2000    # between 2nd and 3rd double-click
+SA_DCLK_DELAY_3_MAX  = 1000    # between 3rd and 4th double-click
+# Character walk speed used to ensure each click is placed far enough ahead
+# that the character cannot reach it before the next double-click fires.
+# 1 px per 5 ms  =  0.2 px/ms
+SA_CHAR_SPEED_PX_PER_MS = 0.2
 
 # ---------------------------------------------------------------------------
 # NC (name-click) targeting mode

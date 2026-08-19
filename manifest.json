@@ -1,15 +1,15 @@
 {
   "bot.py": {
-    "sha256": "54c48083fae35c8180a692cb62d4a309395ac66f4e84a882021152c1a99a02a2",
-    "size": 89141
+    "sha256": "f09c9745523f5fc075db7a499a316ae470e9c8fc0effcdf7cef70906a8def3a3",
+    "size": 118668
   },
   "hotkey_assist.py": {
     "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
     "size": 20400
   },
   "arduino_hid.py": {
-    "sha256": "5e89bb3f85958f143f3e47a751ce0d204f8c3cf9c686988fccd4d6c710ac9ee1",
-    "size": 11695
+    "sha256": "78702967c52c743c2c6cc7e871cd89631333305a24c81f6dfd0b7d395b45f20b",
+    "size": 12735
   },
   "vision.py": {
     "sha256": "0f76aa6a3688babca22319086000235dd036a6f1c7b13fa54781d667b8843df5",
@@ -92,12 +92,12 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "4090563ab7ba3eb4e9e41485034696fe5fbe40238769dd78447144482b18c45c",
-    "size": 47106
+    "sha256": "1382e158e074a74c413533fc45d03631717203f235ef7dfcd295b809217ea2d4",
+    "size": 47582
   },
   "stream_viewer.py": {
-    "sha256": "2de350658abd91ee7a88034029608f9fe120bbddc355f700e4fd168f5571a8a3",
-    "size": 57751
+    "sha256": "1ceed5d42c8c111c35d5010a8af9b020338d9c91b0a3d25576d085f7a800857f",
+    "size": 59027
   },
   "bench_capture.py": {
     "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
@@ -120,8 +120,8 @@
     "size": 2235
   },
   "mouse.ino": {
-    "sha256": "ae9bf4d36d4c02bc497b1a5308e6bca19c0664dd8df352ebde4248bce124d752",
-    "size": 15787
+    "sha256": "51a2c12a0e4f5ad5f49cd3cdf5c7336087352a2c0cf408dd4f1bc99dd6795899",
+    "size": 16588
   },
   "l2cursor.cur": {
     "sha256": "54cb10aff82f637f159577a3c37c5e658dc1f4d03ca441f9ef12a2d726810735",
@@ -175,6 +175,18 @@
     "sha256": "780ae285ce12217b81ab2009fa618d701deaf24998748200cc9c7384623c943d",
     "size": 2058
   },
+  "assets/fullhd/disconnect.png": {
+    "sha256": "8d26f5d0953136063050952cc5a87e08ce869cafd9cd87205b66f25b35933ff7",
+    "size": 4023
+  },
+  "assets/fullhd/healer_farm_anchor.png": {
+    "sha256": "c9596810b9ab8c9c1038e15b544a0e05b1568345bafe5f871da252a7ee3ad586",
+    "size": 939
+  },
+  "assets/fullhd/in_target_blue.png": {
+    "sha256": "ba440ff81bae156666264a942d28a6797cf7d9fcaffb2fd18aa93ca21d9aacb8",
+    "size": 544
+  },
   "assets/fullhd/mob_dead.png": {
     "sha256": "1acad251d7a946bb5dcc8709e7f2a898b8c364c351785642c4551984d66e5d56",
     "size": 4537
@@ -196,8 +208,8 @@
     "size": 1217
   },
   "assets/in_target_blue.png": {
-    "sha256": "da92526fd87b27897d6521c695f7f57f5d627424eae79df45faf0d8caa70db81",
-    "size": 652
+    "sha256": "ba440ff81bae156666264a942d28a6797cf7d9fcaffb2fd18aa93ca21d9aacb8",
+    "size": 544
   },
   "assets/in_target_red.png": {
     "sha256": "2879d1c186b1005586c13b2491583f8f81a9330379f210da95a41b18dcd44ba6",
@@ -220,9 +232,9 @@
     "size": 468
   },
   "config.py": {
-    "sha256": "734bfa897383ff4d50224f2f61da9cfe97c58dc88118465fa993688d7b8e84b9",
-    "shared_sha256": "a96275517975a7ac984434f9259f56b71682cc73ab25842da635378b4d152a5c",
-    "size": 14989,
+    "sha256": "0d05af343de01bb962b1c8923fe849a936dd6f508b20ee8e387e0e8e7f03b4ff",
+    "shared_sha256": "6eded1ff798af9378e1dbdf5ec8b406d3cffe3d6f1a131b18341d4ab1d22a28b",
+    "size": 19298,
     "partial_update": true
   }
 }

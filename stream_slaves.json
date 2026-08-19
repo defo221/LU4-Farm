@@ -2,13 +2,13 @@
   "_comment": "Fleet layout for stream_viewer.py. 'grid' is [cols, rows]; slaves fill it left-to-right, top-to-bottom, and that order is what the 1-9 selection keys follow. Port 8772 matches stream_sender's default and sits clear of 8770 (PXM_RB coordinator), 8081 (PXM_LU4 update server) and 8000 (PXM_RB file server). Replace the host addresses below with each slave's real IP.",
   "grid": [3, 3],
   "slaves": [
-    { "name": "01-12", "host": "192.168.0.181", "port": 8772 },
-    { "name": "01-13", "host": "192.168.0.186", "port": 8772 },
-    { "name": "01-14", "host": "192.168.0.184", "port": 8772 },
-    { "name": "01-15", "host": "192.168.0.182", "port": 8772 },
-    { "name": "01-16", "host": "192.168.0.119", "port": 8772 },
-    { "name": "D01", "host": "192.168.0.170", "port": 8772 },
-    { "name": "D02", "host": "192.168.0.162", "port": 8772 },
+    { "name": "12 Qwinsa", "host": "192.168.0.181", "port": 8772 },
+    { "name": "13 wicc", "host": "192.168.0.186", "port": 8772 },
+    { "name": "14 Glide", "host": "192.168.0.184", "port": 8772 },
+    { "name": "15 Jenit", "host": "192.168.0.182", "port": 8772 },
+    { "name": "16 Dorin", "host": "192.168.0.119", "port": 8772 },
+    { "name": "11 Revoke", "host": "192.168.0.172", "port": 8772 },
+    { "name": "D02 RNine", "host": "192.168.0.162", "port": 8772 },
     { "name": "PC8", "host": "192.168.0.18", "port": 8772 },
     { "name": "PC9", "host": "192.168.0.19", "port": 8772 }
   ]

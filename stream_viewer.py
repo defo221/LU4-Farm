@@ -403,6 +403,7 @@ class Viewer:
         self.active_fps = ACTIVE_FPS
 
         self._pan = None              # active right-drag state
+        self._lmb_down = None         # {"tile": idx, "last": (x, y)} while LMB held
         self._drag_src = None         # tile index where Ctrl+Alt drag started
         self._layout_key = None
         self._alt_held = False        # Alt is down on the viewer keyboard
@@ -463,6 +464,7 @@ class Viewer:
     def _bind(self):
         c = self.canvas
         c.bind("<Button-1>", self._on_left_down)
+        c.bind("<B1-Motion>", self._on_left_motion)
         c.bind("<ButtonRelease-1>", self._on_left_up)
         c.bind("<Button-2>", self._on_middle_down)
         c.bind("<Button-3>", self._on_right_down)
@@ -914,13 +916,14 @@ class Viewer:
             self._drag_src = idx
             return
         if self.zoomed:
-            # Zoom mode: forward click to whichever tile was clicked, no layout
+            # Zoom mode: forward press to whichever tile was clicked, no layout
             # swap.  _set_hover routes keyboard/FPS to that tile.
             self._set_hover(idx)
             t = self.tiles[idx]
             pos = t.canvas_to_slave(event.x, event.y)
             if pos is not None:
-                t.link.send({"t": "click", "x": pos[0], "y": pos[1], "btn": "left"})
+                t.link.send({"t": "mdown", "x": pos[0], "y": pos[1], "btn": "left"})
+                self._lmb_down = {"tile": idx, "last": (event.x, event.y)}
             return
         # Grid mode: first click focuses the tile; subsequent clicks act.
         if idx != self.selected:
@@ -930,29 +933,49 @@ class Viewer:
         pos = t.canvas_to_slave(event.x, event.y)
         if pos is None:
             return
-        t.link.send({"t": "click", "x": pos[0], "y": pos[1], "btn": "left"})
+        t.link.send({"t": "mdown", "x": pos[0], "y": pos[1], "btn": "left"})
+        self._lmb_down = {"tile": idx, "last": (event.x, event.y)}
+
+    def _on_left_motion(self, event):
+        """Send relative mouse movement while LMB is held (drag support)."""
+        if self._lmb_down is None:
+            return
+        t = self.tiles[self._lmb_down["tile"]]
+        lx, ly = self._lmb_down["last"]
+        self._lmb_down["last"] = (event.x, event.y)
+        dx_c = event.x - lx
+        dy_c = event.y - ly
+        if dx_c == 0 and dy_c == 0:
+            return
+        dx, dy = t.canvas_delta_to_slave(dx_c, dy_c)
+        if dx != 0 or dy != 0:
+            t.link.send({"t": "moverel", "dx": dx, "dy": dy})
 
     def _on_left_up(self, event):
-        """Complete a Ctrl+Alt drag-to-swap gesture."""
+        """Release LMB on the slave, or complete a Ctrl+Alt drag-to-swap."""
+        # Ctrl+Alt swap gesture takes priority: if active, handle it and skip
+        # the normal LMB-up path entirely (no mdown was sent in this case).
         src = self._drag_src
         self._drag_src = None
-        if src is None:
+        if src is not None:
+            dst = self._tile_at(event.x, event.y)
+            if dst is not None and dst != src:
+                a, b = self.tiles[src], self.tiles[dst]
+                a.link, b.link = b.link, a.link
+                a.fps_locked, b.fps_locked = b.fps_locked, a.fps_locked
+                if self.selected == src:
+                    self.selected = dst
+                elif self.selected == dst:
+                    self.selected = src
+                self.hover_idx = None
+                self._layout_key = None
             return
-        dst = self._tile_at(event.x, event.y)
-        if dst is None or dst == src:
-            return
-        # Swap the two tiles' links (and all per-tile state).
-        a, b = self.tiles[src], self.tiles[dst]
-        a.link, b.link = b.link, a.link
-        a.fps_locked, b.fps_locked = b.fps_locked, a.fps_locked
-        # If either tile was selected, update the selection index.
-        if self.selected == src:
-            self.selected = dst
-        elif self.selected == dst:
-            self.selected = src
-        # Reset hover so FPS state is re-evaluated on next mouse-move.
-        self.hover_idx = None
-        self._layout_key = None
+
+        # Normal LMB release: send mup to the tile that received the mdown.
+        held = self._lmb_down
+        self._lmb_down = None
+        if held is not None:
+            self.tiles[held["tile"]].link.send({"t": "mup", "btn": "left"})
 
     def _on_middle_down(self, event):
         """Toggle per-tile max-FPS lock.  Never forwarded to the slave."""
@@ -1189,12 +1212,12 @@ class Viewer:
             self._pick_tile_by_digit(ks)
             return "break"
 
-        # ` (backtick/grave, VK 192) toggles zoom.  Match both the keysym AND
-        # the physical key code so the binding works in any keyboard layout.
-        # Trade-off: ё (same physical key in Russian layout) cannot be typed
-        # through the viewer — it will toggle zoom instead.
-        # Z / Я and every other letter key pass straight through.
-        if ks == "grave" or event.keycode == 192:
+        # Alt+` (Alt + backtick/grave, VK 192) toggles zoom.  Alt must already
+        # be held (_alt_held).  The Alt state is consumed here so neither the
+        # Alt keydown nor the grave reach the slave.  Bare ` / ё passes through.
+        if self._alt_held and (ks == "grave" or event.keycode == 192):
+            self._alt_held  = False   # consumed — don't flush to slave
+            self._alt_combo = True    # suppress the Alt-up as well
             self.zoomed = not self.zoomed
             self._layout_key = None
             if self.zoomed:

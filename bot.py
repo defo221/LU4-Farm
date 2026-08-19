@@ -21,13 +21,14 @@ Flow per cycle
 """
 
 import glob
+import math
 import os
 import sys
 import random
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -125,6 +126,89 @@ _BLUE_HI = np.array([135, 255, 255], dtype=np.uint8)
 
 _RED_COL_THRESHOLD  = 0.15   # fraction of bar height that must be red per column
 _BLUE_COL_THRESHOLD = 0.15
+
+
+# ---------------------------------------------------------------------------
+# Single-assist target-approach helpers  (no UI, no overlay)
+# ---------------------------------------------------------------------------
+
+def _sa_nms(pts: List[Tuple[int, int]], min_dist: int = 8) -> List[Tuple[int, int]]:
+    """Non-maximum suppression: drop detections within min_dist of an earlier one."""
+    kept: List[Tuple[int, int]] = []
+    for p in pts:
+        if all(math.hypot(p[0] - k[0], p[1] - k[1]) >= min_dist for k in kept):
+            kept.append(p)
+    return kept
+
+
+def _sa_find_blue_dots(frame: np.ndarray,
+                       tmpl: Optional[np.ndarray],
+                       conf: float = 0.75,
+                       nms_dist: int = 8) -> List[Tuple[int, int]]:
+    """Return (cx, cy) centres for every in_target_blue detection in *frame*.
+
+    Returns an empty list when the template is None or no match is found.
+    """
+    if tmpl is None or frame is None:
+        return []
+    th, tw = tmpl.shape[:2]
+    res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+    ys, xs = np.where(res >= conf)
+    raw = [(int(x + tw // 2), int(y + th // 2)) for x, y in zip(xs, ys)]
+    raw.sort(key=lambda p: p[0])           # left-to-right for stable pairing
+    return _sa_nms(raw, nms_dist)
+
+
+def _sa_blue_pair_center(dots: List[Tuple[int, int]],
+                         max_dy: int = 6,
+                         min_dx: int = 4) -> Optional[Tuple[int, int]]:
+    """Return the target point derived from in_target_blue detections.
+
+    Priority:
+      1. Midpoint of the first valid left-right pair (same pairing logic as
+         test_dual_dot_overlay.py — same row, separated horizontally).
+      2. If no pair qualifies, fall back to the first single dot's position so
+         the approach corridor can still be built toward it.
+      3. Returns None only when no dots were detected at all.
+    """
+    if not dots:
+        return None
+    for i, left in enumerate(dots):
+        for right in dots[i + 1:]:
+            dx = right[0] - left[0]
+            dy = abs(right[1] - left[1])
+            if dx >= min_dx and dy <= max_dy:
+                return (left[0] + right[0]) // 2, (left[1] + right[1]) // 2
+    # No valid pair — use the single (or nearest) dot as the target
+    return dots[0]
+
+
+def _sa_corridor_point(sx: int, sy: int,
+                       tx: int, ty: int,
+                       half_w: int,
+                       min_dist_px: int = 0,
+                       max_dist_px: int = 0) -> Tuple[int, int]:
+    """Return a random point inside the *half_w*-px-half-width strip running
+    from screen centre (sx, sy) toward target (tx, ty).
+
+    min_dist_px: minimum distance from (sx, sy) — ensures the character
+                 cannot reach the click point before the next action fires.
+    max_dist_px: upper bound on distance; 0 = 85% of the total distance to
+                 target (avoids overshooting).
+    """
+    dx, dy = tx - sx, ty - sy
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length   # unit vector toward target
+    perp_x, perp_y = -uy, ux            # perpendicular unit vector
+
+    cap = max_dist_px if max_dist_px > 0 else length * 0.85
+    lo  = max(0.0, min(float(min_dist_px), cap * 0.95))
+    d   = random.uniform(lo, cap)
+
+    off = random.uniform(-half_w, half_w)
+    cx  = int(sx + ux * d + perp_x * off)
+    cy  = int(sy + uy * d + perp_y * off)
+    return cx, cy
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +551,7 @@ class FarmBot:
         self._char_anchor  = AnchorFinder(_ap("char_bars_anchor.png"), max_y=_top)
         self._mob_dead_f   = AnchorFinder(_ap("mob_dead.png"))
         self._death_f      = AnchorFinder(_ap("death_screen.png"),    confidence=0.85)
+        self._disconnect_f = AnchorFinder(_ap("disconnect.png"),      confidence=cfg.DC_CONFIDENCE)
         self._buff_f       = AnchorFinder(_ap("full_buff_check.png"),  confidence=0.85)
         self._buff_f1      = AnchorFinder(_ap("full_buff_check1.png"), confidence=0.85)
         self._party_f      = AnchorFinder(_ap("party_pl_anchor.png"),
@@ -504,6 +589,21 @@ class FarmBot:
 
         self._dot_red_tmpl:  Optional[np.ndarray] = _load_opt("in_target_red.png")
         self._dot_blue_tmpl: Optional[np.ndarray] = _load_opt("in_target_blue.png")
+
+        # Single-assist phase-3: healer fallback anchor (optional)
+        _healer_path = _ap("healer_farm_anchor.png")
+        _healer_tmpl = cv2.imread(_healer_path)
+        if _healer_tmpl is not None:
+            self._healer_anchor: Optional[AnchorFinder] = AnchorFinder(
+                _healer_path, confidence=0.60)
+            logger.info(f"[BOT] healer_farm_anchor loaded: {_healer_path}")
+        else:
+            self._healer_anchor = None
+            logger.info("[BOT] healer_farm_anchor.png not found — phase-3 will rotate camera only")
+
+        # True while the bot is in the healer-area recovery loop.
+        # Cleared as soon as a post-recovery RMB succeeds.
+        self._sa_recovery_mode: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -810,12 +910,12 @@ class FarmBot:
         # ---- 1. Target search in current window ----
         opp = self._opposite()
         if opp is None and self._active.targeting_mode == "assist":
-            # Single-window assist: loop RMB bursts until bag_mob_anchor is found.
-            # Each failed attempt: check buff/death, then verify party leader is
-            # still visible.  If party_pl_anchor disappears → stop the bot.
+            # Single-window assist: phase-based targeting loop.
+            # _single_assist_cycle() handles all RMB / F5 / healer / approach
+            # logic and calls _press_attack() internally on success.
+            # Each failed iteration: check buff/death + party leader presence.
             while True:
-                if self._target_search():
-                    self._press_attack()
+                if self._single_assist_cycle():
                     break
                 capslock.raise_if_on()
                 self._check_buff_and_death()
@@ -898,12 +998,18 @@ class FarmBot:
                 return "ok"
             if hp_result == "timeout":
                 return "timeout"
-            # "stalled": mob never took damage — find a new target without recovery.
-            # The targeting dot stays on the stalled mob (no ESC pressed), so NC/nexttarget
-            # target search will naturally skip or move past it.
+            # "stalled": restart target search.
+            # For single-window assist: reset recovery state and run the full
+            # phase-based cycle (_single_assist_cycle handles _press_attack internally).
+            # For all other modes: use the legacy _target_search path.
             logger.info("[BOT] Stall — restarting target search")
-            if self._target_search():
-                self._press_attack()    # skips automatically for both-assist
+            opp_stall = self._opposite()
+            if opp_stall is None and self._active.targeting_mode == "assist":
+                self._sa_recovery_mode = False
+                self._single_assist_cycle()
+            else:
+                if self._target_search():
+                    self._press_attack()
             # loop back to _wait_low_hp()
 
         # ---- 6. Finisher F2 ----
@@ -1223,6 +1329,537 @@ class FarmBot:
     # Target search (dispatcher)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Single-window assist: phase-based target acquisition + approach
+    # ------------------------------------------------------------------
+
+    def _rotate_camera_180(self) -> None:
+        """Rotate the in-game camera approximately 180° via a horizontal RMB drag."""
+        logger.info("[BOT] SA: rotating camera 180°")
+        self.hid.drag_camera(cfg.SA_CAMERA_ROTATE_DX)
+
+    def _sa_phase4(self, frame: np.ndarray) -> bool:
+        """in_target_blue approach + attack (phase 4).
+
+        Called once bag_mob_anchor is confirmed on *frame*.
+        Checks for in_target_blue, rotates camera if not found, then approaches
+        via double-clicks in a corridor.  Always calls _press_attack() and
+        returns True.
+        """
+        fh, fw = frame.shape[:2]
+        sc_x, sc_y = fw // 2, fh // 2
+
+        def _dot_center_from(f: np.ndarray) -> Optional[Tuple[int, int]]:
+            dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
+                                      conf=cfg.NC_CONFIDENCE,
+                                      nms_dist=cfg.NC_NMS_DIST)
+            return _sa_blue_pair_center(dots)
+
+        pair_center = _dot_center_from(frame)
+
+        if pair_center is None:
+            logger.info("[BOT] SA: in_target_blue not found — rotating camera")
+            self._rotate_camera_180()
+            capslock.raise_if_on()
+            frame = self._grab()
+            pair_center = _dot_center_from(frame)
+            if pair_center is None:
+                logger.info("[BOT] SA: in_target_blue still not found — normal attack")
+                self._press_attack()
+                return True
+
+        dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
+        logger.info(f"[BOT] SA: in_target_blue at {pair_center}, dist={dist:.0f}px")
+
+        if dist < cfg.SA_APPROACH_PX:
+            logger.info("[BOT] SA: close enough — attacking")
+            self._press_attack()
+            return True
+
+        # Approach via double-clicks in corridor.
+        # Each iteration: fresh grab → recalculate distance → click → wait.
+        dclk_delays_max = [
+            cfg.SA_DCLK_DELAY_1_MAX,
+            cfg.SA_DCLK_DELAY_2_MAX,
+            cfg.SA_DCLK_DELAY_3_MAX,
+        ]
+        for dclk_i in range(cfg.SA_APPROACH_MAX_DCLK):
+            capslock.raise_if_on()
+
+            # Fresh grab before every click — use the latest mob position.
+            frame = self._grab()
+            pair_center = _dot_center_from(frame)
+            if pair_center is None:
+                logger.info("[BOT] SA: in_target_blue lost before approach"
+                            f" click #{dclk_i + 1} — attacking")
+                break
+            dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
+            if dist < cfg.SA_APPROACH_PX:
+                logger.info(f"[BOT] SA: close enough before click #{dclk_i + 1}"
+                            f" (dist={dist:.0f}px) — attacking")
+                break
+
+            delay_max_ms = (dclk_delays_max[dclk_i]
+                            if dclk_i < len(dclk_delays_max)
+                            else dclk_delays_max[-1])
+            min_dist = int(delay_max_ms * cfg.SA_CHAR_SPEED_PX_PER_MS)
+
+            # Perspective correction: shift the corridor target downward by an
+            # amount proportional to how far the mob is from the 12/6 o'clock
+            # axis.  abs(ux) = 0 at vertical, 1 at horizontal (3/9 o'clock).
+            raw_dx   = pair_center[0] - sc_x
+            raw_dy   = pair_center[1] - sc_y
+            raw_len  = math.hypot(raw_dx, raw_dy) or 1.0
+            h_factor = abs(raw_dx) / raw_len
+            down_px  = int(h_factor * cfg.SA_APPROACH_DOWN_OFFSET_MAX)
+            eff_ty   = pair_center[1] + down_px   # shifted target Y
+
+            click_pt = _sa_corridor_point(sc_x, sc_y,
+                                          pair_center[0], eff_ty,
+                                          cfg.SA_CORRIDOR_W // 2,
+                                          min_dist_px=min_dist)
+            logger.info(f"[BOT] SA: approach double-click #{dclk_i + 1}"
+                        f" at {click_pt}, dist={dist:.0f}px,"
+                        f" h_factor={h_factor:.2f}, down_offset={down_px}px")
+            self.hid.double_click_at(click_pt[0], click_pt[1])
+            if delay_max_ms > 0:
+                capslock.interruptible_sleep(random.uniform(0, delay_max_ms / 1000.0))
+
+        self._press_attack()
+        return True
+
+    def _sa_f5_loop(self) -> bool:
+        """Recovery F5 loop: press F5, wait SA_F5_WAIT_MS, check bag_mob_anchor.
+
+        When bag_mob_anchor is not found, runs buff/death and party-anchor checks
+        and then sleeps for the remainder of SA_F5_LOOP_INTERVAL_S before the
+        next F5 press.  CapsLock is honoured on every iteration.
+
+        Loops until a target is found, then calls _sa_phase4() and returns True.
+        """
+        logger.info("[BOT] SA: entering F5 recovery loop"
+                    f" (interval {cfg.SA_F5_LOOP_INTERVAL_S:.0f}s)")
+        f5_count = 0
+        while True:
+            capslock.raise_if_on()
+            f5_count += 1
+            _press(self.hid, "f5")
+            capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
+            frame = self._grab()
+            self._mob_anchor.invalidate()
+            if self._mob_anchor.find(frame) is not None:
+                logger.info(f"[BOT] SA F5 loop: target found after {f5_count} F5(s)")
+                return self._sa_phase4(frame)
+
+            # Not found — run safety checks, then fill the rest of the interval.
+            t_checks = time.time()
+
+            # 1. Buff + death check
+            capslock.raise_if_on()
+            self._check_buff_and_death()
+
+            # 2. Party-leader check
+            capslock.raise_if_on()
+            if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
+                frame = self._grab()
+                if self._party_f.find(frame) is None and not self._recheck_party_anchor():
+                    msg = (f"{self._active.nickname()}: party leader not detected"
+                           f" — stopping.")
+                    logger.warn(f"[BOT] {msg}")
+                    self.tg.send(msg)
+                    raise StopBot
+
+            # 3. Disconnect check
+            capslock.raise_if_on()
+            frame = self._grab()
+            if self._disconnect_f.find(frame) is not None:
+                nick = self._active.nickname()
+                msg  = f"{cfg.PC_NUMBER}: {nick} — disconnect screen detected!"
+                logger.warn(f"[BOT] {msg}")
+                self.tg.send(msg)
+                raise StopBot
+
+            # Sleep the remaining portion of the configured interval
+            capslock.raise_if_on()
+            elapsed = time.time() - t_checks
+            remaining = cfg.SA_F5_LOOP_INTERVAL_S - elapsed
+            if remaining > 0:
+                capslock.interruptible_sleep(remaining)
+
+    def _sa_phase3_rmb_f5_loop(self, frame: np.ndarray) -> bool:
+        """RMB-first F5 loop used inside Phase-3 recovery.
+
+        Per iteration:
+          1. RMB at screen centre → delay SA_RMB_WAIT_MS → check bag_mob_anchor.
+             Found → clear _sa_recovery_mode, _sa_phase4(), return True.
+          2. x1 Esc → x1 F5 → delay SA_F5_WAIT_MS → check + full safety checks.
+             Found via F5 → kill (_sa_phase4) → F5-kill sub-loop until F5 yields
+                            no target → sleep SA_HEALER_PRE_DELAY_MAX → return False.
+             Not found    → sleep SA_HEALER_POST_PAUSE_MIN → repeat from step 1.
+
+        Returns True  – RMB acquisition succeeded; recovery mode cleared; phase4 called.
+        Returns False – F5 kill-chain exhausted; caller should restart healer-area clicks.
+        """
+        pt = self._active.assist_point
+        iteration = 0
+
+        while True:
+            capslock.raise_if_on()
+            iteration += 1
+            logger.info(f"[BOT] SA phase-3 RMB+F5 iter {iteration}")
+
+            # --- Step 1: RMB at crosshair (assist_point) -------------------------
+            if pt is not None:
+                self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+            else:
+                logger.warn("[BOT] SA phase-3: assist_point not set — skipping RMB")
+            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            frame = self._grab()
+            self._mob_anchor.invalidate()
+
+            if self._mob_anchor.find(frame) is not None:
+                logger.info("[BOT] SA phase-3: target via RMB → exit recovery")
+                self._sa_recovery_mode = False
+                self._sa_phase4(frame)
+                return True
+
+            # --- Step 2: Esc + F5 ------------------------------------------------
+            capslock.raise_if_on()
+            _press(self.hid, "esc")
+            _press(self.hid, "f5")
+            capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
+            frame = self._grab()
+            self._mob_anchor.invalidate()
+            found_via_f5 = self._mob_anchor.find(frame) is not None
+
+            # Safety checks (always run)
+            capslock.raise_if_on()
+            self._check_buff_and_death()
+
+            capslock.raise_if_on()
+            if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
+                chk = self._grab()
+                if (self._party_f.find(chk) is None
+                        and not self._recheck_party_anchor()):
+                    msg = (f"{self._active.nickname()}: party leader not"
+                           " detected — stopping.")
+                    logger.warn(f"[BOT] {msg}")
+                    self.tg.send(msg)
+                    raise StopBot
+
+            capslock.raise_if_on()
+            chk = self._grab()
+            if self._disconnect_f.find(chk) is not None:
+                nick = self._active.nickname()
+                msg  = f"{cfg.PC_NUMBER}: {nick} — disconnect screen detected!"
+                logger.warn(f"[BOT] {msg}")
+                self.tg.send(msg)
+                raise StopBot
+
+            if found_via_f5:
+                logger.info("[BOT] SA phase-3: target via F5 — killing")
+                self._sa_phase4(frame)
+
+                # F5-kill sub-loop: keep pressing F5 until no more targets
+                kill_n = 1
+                while True:
+                    capslock.raise_if_on()
+                    _press(self.hid, "f5")
+                    capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
+                    frame = self._grab()
+                    self._mob_anchor.invalidate()
+                    if self._mob_anchor.find(frame) is not None:
+                        kill_n += 1
+                        logger.info(f"[BOT] SA phase-3: F5 kill #{kill_n}")
+                        self._sa_phase4(frame)
+                    else:
+                        logger.info(
+                            f"[BOT] SA phase-3: F5 chain done after {kill_n} kill(s)")
+                        break
+
+                # Wait before returning to healer stage
+                pre_delay = random.uniform(0, cfg.SA_HEALER_PRE_DELAY_MAX)
+                logger.info(
+                    f"[BOT] SA phase-3: pre-healer wait {pre_delay:.1f}s")
+                capslock.interruptible_sleep(pre_delay)
+                return False
+
+            # Neither RMB nor F5 found target — wait and loop
+            capslock.raise_if_on()
+            logger.info(
+                f"[BOT] SA phase-3: no target, waiting"
+                f" {cfg.SA_HEALER_POST_PAUSE_MIN:.1f}s")
+            capslock.interruptible_sleep(cfg.SA_HEALER_POST_PAUSE_MIN)
+
+    def _sa_center_fallback(self, frame: np.ndarray) -> bool:
+        """No-healer fallback: 0–3 s delay, 1–2 centred clicks, then phase-3 RMB+F5 loop.
+
+        Click area  : SA_FALLBACK_CLICK_AREA × SA_FALLBACK_CLICK_AREA centred
+                      on the screen.
+        1st click   : anywhere in the area except the SA_FALLBACK_EXCL_W ×
+                      SA_FALLBACK_EXCL_H central exclusion zone.
+        2nd click   : SA_FALLBACK_CLICK_PROX_MIN..MAX px from the first click,
+                      still within the area; preceded by a 0..SA_FALLBACK_CLICK2_GAP_MAX ms gap.
+        """
+        fh, fw = frame.shape[:2]
+        sc_x, sc_y = fw // 2, fh // 2
+        half  = cfg.SA_FALLBACK_CLICK_AREA // 2
+        ex_hw = cfg.SA_FALLBACK_EXCL_W  // 2   # exclusion half-width
+        ex_hh = cfg.SA_FALLBACK_EXCL_H  // 2   # exclusion half-height
+
+        # ---- Pre-delay ---------------------------------------------------------
+        delay = random.uniform(0, cfg.SA_FALLBACK_DELAY_MAX)
+        logger.info(f"[BOT] SA fallback: pre-delay {delay:.1f}s")
+        capslock.interruptible_sleep(delay)
+
+        # ---- First click (avoid centre exclusion zone) -------------------------
+        capslock.raise_if_on()
+        for _ in range(50):
+            rx = sc_x + random.randint(-half, half)
+            ry = sc_y + random.randint(-half, half)
+            if abs(rx - sc_x) > ex_hw or abs(ry - sc_y) > ex_hh:
+                break   # outside exclusion zone
+        logger.info(f"[BOT] SA fallback: click 1 at ({rx},{ry})")
+        self.hid.move_and_click(rx, ry)
+        first = (rx, ry)
+
+        # ---- Optional second click (50–100 px from first, within area) ---------
+        if random.random() < 0.5:    # 50 % chance of a second click
+            capslock.raise_if_on()
+            capslock.interruptible_sleep(
+                random.uniform(0, cfg.SA_FALLBACK_CLICK2_GAP_MAX / 1000.0))
+            for _ in range(50):
+                angle = random.uniform(0, 2 * math.pi)
+                dist  = random.uniform(cfg.SA_FALLBACK_CLICK_PROX_MIN,
+                                       cfg.SA_FALLBACK_CLICK_PROX_MAX)
+                cx = int(first[0] + math.cos(angle) * dist)
+                cy = int(first[1] + math.sin(angle) * dist)
+                if abs(cx - sc_x) <= half and abs(cy - sc_y) <= half:
+                    break   # within area
+            logger.info(f"[BOT] SA fallback: click 2 at ({cx},{cy})")
+            self.hid.move_and_click(cx, cy)
+
+        capslock.raise_if_on()
+        return self._sa_phase3_rmb_f5_loop(frame)
+
+    def _sa_healer_area_then_f5(self, frame: np.ndarray) -> bool:
+        """Phase-3 outer loop: healer-area clicks → _sa_phase3_rmb_f5_loop.
+
+        Each pass:
+          1. Find healer_farm_anchor (rotate camera 180° if not found).
+          2a. Still not found → _sa_center_fallback (centred clicks +
+              _sa_phase3_rmb_f5_loop).
+          2b. Found → 0–SA_HEALER_PRE_DELAY_MAX s delay → 1–3 proximity-
+              constrained clicks in SA_HEALER_CLICK_AREA → SA_HEALER_POST_PAUSE
+              → _sa_phase3_rmb_f5_loop.
+          If _sa_phase3_rmb_f5_loop returns True  → return True (recovery exited
+              via RMB).
+          If _sa_phase3_rmb_f5_loop returns False → grab fresh frame and loop
+              back to step 1 (redo healer-area clicks).
+        """
+        def _find_healer(f):
+            return (self._healer_anchor.find(f)
+                    if self._healer_anchor is not None else None)
+
+        def _healer_bounds(hp: Tuple[int, int], f: np.ndarray):
+            h = cfg.SA_HEALER_CLICK_AREA // 2
+            fh_ = f.shape[0]
+            above = hp[1] < fh_ // 2
+            xn = hp[0] - h
+            xx = hp[0] + h
+            yn = hp[1] - (cfg.SA_HEALER_UPPER_EXTEND if above else h)
+            yx = hp[1] + (h if above else cfg.SA_HEALER_LOWER_EXTEND)
+            ehw = cfg.SA_HEALER_EXCL_W // 2
+            ebot = hp[1] + cfg.SA_HEALER_EXCL_H
+            return xn, xx, yn, yx, ehw, ebot
+
+        def _pick_healer_pt(xn, xx, yn, yx, ehw, ebot, hp,
+                            prev_pt, require_prox: bool):
+            for _ in range(60):
+                cx = random.randint(xn, xx)
+                cy = random.randint(yn, yx)
+                if abs(cx - hp[0]) <= ehw and hp[1] <= cy <= ebot:
+                    continue
+                if require_prox and prev_pt is not None:
+                    d = math.hypot(cx - prev_pt[0], cy - prev_pt[1])
+                    if not (cfg.SA_HEALER_CLICK_PROX_MIN <= d
+                            <= cfg.SA_HEALER_CLICK_PROX_MAX):
+                        continue
+                return cx, cy
+            return hp
+
+        while True:
+            capslock.raise_if_on()
+
+            # Invalidate cache so a fresh detection is performed each pass.
+            if self._healer_anchor is not None:
+                self._healer_anchor.invalidate()
+
+            healer_pos = _find_healer(frame)
+            if healer_pos is None:
+                logger.info(
+                    "[BOT] SA phase-3: healer anchor not found — rotating camera")
+                self._rotate_camera_180()
+                capslock.raise_if_on()
+                frame = self._grab()
+                if self._healer_anchor is not None:
+                    self._healer_anchor.invalidate()
+                healer_pos = _find_healer(frame)
+                if healer_pos is None:
+                    logger.info(
+                        "[BOT] SA phase-3: healer still not found — centre fallback")
+                    result = self._sa_center_fallback(frame)
+                    if result:
+                        return True
+                    # _sa_phase3_rmb_f5_loop already slept SA_HEALER_PRE_DELAY_MAX
+                    frame = self._grab()
+                    continue
+
+            # ---- Healer anchor found -------------------------------------------
+            pre_delay = random.uniform(0, cfg.SA_HEALER_PRE_DELAY_MAX)
+            logger.info(f"[BOT] SA phase-3: healer at {healer_pos},"
+                        f" pre-delay {pre_delay:.1f}s")
+            capslock.interruptible_sleep(pre_delay)
+
+            clicks = random.randint(1, 3)
+            logger.info(f"[BOT] SA phase-3: {clicks} click(s) in"
+                        f" {cfg.SA_HEALER_CLICK_AREA}px area")
+
+            def _do_extra_click(click_n: int, prev_pt: Tuple[int, int],
+                                prev_hp: Tuple[int, int],
+                                prev_frame: np.ndarray,
+                                gap_max_s: float) -> Tuple[int, int]:
+                capslock.interruptible_sleep(random.uniform(0, gap_max_s))
+                capslock.raise_if_on()
+                f = self._grab()
+                self._healer_anchor.invalidate()
+                hp = _find_healer(f)
+                if hp is None:
+                    hp = prev_hp
+                    f  = prev_frame
+                    logger.info(
+                        f"[BOT] SA phase-3: healer anchor lost before click"
+                        f" {click_n} — reusing previous position")
+                xn, xx, yn, yx, ehw, ebot = _healer_bounds(hp, f)
+                pt = _pick_healer_pt(xn, xx, yn, yx, ehw, ebot,
+                                     hp, prev_pt, require_prox=True)
+                if pt == hp:
+                    logger.info(
+                        f"[BOT] SA phase-3: proximity relaxed for click {click_n}"
+                        " (area too far from previous click)")
+                    pt = _pick_healer_pt(xn, xx, yn, yx, ehw, ebot,
+                                         hp, None, require_prox=False)
+                logger.info(f"[BOT] SA phase-3: click {click_n}/{clicks} at {pt}"
+                            f"  [bounds x:{xn}..{xx} y:{yn}..{yx}]")
+                self.hid.move_and_click(pt[0], pt[1])
+                return pt
+
+            # Click 1
+            capslock.raise_if_on()
+            xn1, xx1, yn1, yx1, ehw1, ebot1 = _healer_bounds(healer_pos, frame)
+            rx, ry = _pick_healer_pt(xn1, xx1, yn1, yx1, ehw1, ebot1,
+                                     healer_pos, None, require_prox=False)
+            logger.info(f"[BOT] SA phase-3: click 1/{clicks} at ({rx},{ry})"
+                        f"  [bounds x:{xn1}..{xx1} y:{yn1}..{yx1}]")
+            self.hid.move_and_click(rx, ry)
+            prev1 = (rx, ry)
+
+            if clicks >= 2:
+                prev2 = _do_extra_click(2, prev1, healer_pos, frame, gap_max_s=2.0)
+            if clicks >= 3:
+                _do_extra_click(3, prev2, healer_pos, frame, gap_max_s=1.0)
+
+            # Post-pause
+            post_pause = random.uniform(cfg.SA_HEALER_POST_PAUSE_MIN,
+                                        cfg.SA_HEALER_POST_PAUSE_MAX)
+            logger.info(f"[BOT] SA phase-3: post-click pause {post_pause:.1f}s")
+            capslock.interruptible_sleep(post_pause)
+
+            capslock.raise_if_on()
+            result = self._sa_phase3_rmb_f5_loop(frame)
+            if result:
+                return True
+            # F5 chain exhausted — grab fresh frame and redo healer clicks
+            frame = self._grab()
+
+    def _single_assist_cycle(self) -> bool:
+        """Phase-based target search + in_target_blue approach for single-window assist.
+
+        Normal mode  (self._sa_recovery_mode == False):
+          Phase 1: SA_RMB_ATTEMPTS RMB clicks at assist_point.
+          Phase 2: SA_F5_ATTEMPTS  F5 presses.
+          If all fail → set _sa_recovery_mode = True → healer-area recovery.
+
+        Recovery mode (self._sa_recovery_mode == True):
+          1 RMB click + check.
+          Found  → clear _sa_recovery_mode → phase 4 → return True.
+          Not found → stay in recovery → healer-area recovery.
+
+        Healer-area recovery:
+          pre-delay → proximity clicks in SA_HEALER_CLICK_AREA →
+          post-pause → infinite F5 loop until target found →
+          phase 4 → return True.
+          (if healer anchor not visible: rotate camera 180° → return False)
+
+        Returns True  → target acquired and _press_attack() called.
+        Returns False → no target this iteration; outer loop should retry.
+        """
+        pt = self._active.assist_point
+
+        if not self._sa_recovery_mode:
+            # ---- Phase 1: SA_RMB_ATTEMPTS RMB clicks ---------------------------
+            for i in range(cfg.SA_RMB_ATTEMPTS):
+                capslock.raise_if_on()
+                if pt is not None:
+                    logger.info(
+                        f"[BOT] SA phase-1 RMB #{i + 1}/{cfg.SA_RMB_ATTEMPTS}")
+                    self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+                else:
+                    logger.warn("[BOT] SA: assist_point not set — skipping RMB")
+                capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                frame = self._grab()
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is not None:
+                    logger.info("[BOT] SA: bag_mob_anchor found after RMB")
+                    return self._sa_phase4(frame)
+
+            # ---- Phase 2: SA_F5_ATTEMPTS F5 presses ----------------------------
+            for i in range(cfg.SA_F5_ATTEMPTS):
+                capslock.raise_if_on()
+                logger.info(f"[BOT] SA phase-2 F5 #{i + 1}/{cfg.SA_F5_ATTEMPTS}")
+                _press(self.hid, "f5")
+                capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
+                frame = self._grab()
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is not None:
+                    logger.info("[BOT] SA: bag_mob_anchor found after F5")
+                    return self._sa_phase4(frame)
+
+            # All normal attempts exhausted → enter recovery
+            logger.info("[BOT] SA: entering recovery mode")
+            self._sa_recovery_mode = True
+            return self._sa_healer_area_then_f5(frame)
+
+        else:
+            # ---- Recovery mode: single RMB check -------------------------------
+            capslock.raise_if_on()
+            if pt is not None:
+                logger.info("[BOT] SA recovery: 1 RMB check")
+                self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+            else:
+                logger.warn("[BOT] SA: assist_point not set — skipping recovery RMB")
+            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            frame = self._grab()
+            self._mob_anchor.invalidate()
+            if self._mob_anchor.find(frame) is not None:
+                logger.info("[BOT] SA: target found — exiting recovery mode")
+                self._sa_recovery_mode = False
+                return self._sa_phase4(frame)
+
+            # Still no target — stay in recovery
+            logger.info("[BOT] SA: RMB failed in recovery — continuing healer loop")
+            return self._sa_healer_area_then_f5(frame)
+
     def _target_search(self) -> bool:
         """Acquire a target then verify via bag_mob_anchor.
 
@@ -1510,18 +2147,17 @@ class FarmBot:
                 return "stalled"
 
             # Stall check (assist): mob HP stuck at ≥ HP_STALL_PCT for HP_STALL_S seconds.
-            # LMB burst on the party bar to re-click the party leader, then notify and
-            # restart — the party leader may have moved or re-engaged a different mob.
+            # 0–3 s jitter → LMB burst at assist_point → 5–10 s wait → return "stalled"
+            # so _cycle can reset recovery state and restart from Phase 1.
             if (self._active.targeting_mode == "assist"
                     and not hp_ever_dropped
                     and time.time() > stall_deadline):
-                pt = self._active.assist_point
+                pt   = self._active.assist_point
                 nick = self._active.title
                 jitter = random.uniform(cfg.HP_STALL_JITTER_MIN, cfg.HP_STALL_JITTER_MAX)
                 logger.info(
                     f"[BOT] [{nick}] Assist HP stall: mob at ≥{cfg.HP_STALL_PCT}%"
-                    f" for {cfg.HP_STALL_S}s — waiting {jitter:.1f}s jitter,"
-                    f" then LMB burst on party bar, restarting"
+                    f" for {cfg.HP_STALL_S}s — jitter {jitter:.1f}s, then LMB burst"
                 )
                 capslock.interruptible_sleep(jitter)
                 if pt is not None:
@@ -1536,15 +2172,9 @@ class FarmBot:
                                 cfg.ASSIST_RMB_INTERVAL_MIN_MS / 1000.0,
                                 cfg.ASSIST_RMB_INTERVAL_MAX_MS / 1000.0,
                             ))
-                wait_s = random.uniform(cfg.RECOVERY_WAIT_MIN, cfg.RECOVERY_WAIT_MAX)
-                logger.info(f"[BOT] [{nick}] Waiting {wait_s:.1f}s after LMB burst")
-                time.sleep(wait_s)
-                self._notifier.notify(
-                    nick, "assist_stall",
-                    f"{cfg.PC_NUMBER}: {nick} assist stall: mob HP did not drop for"
-                    f" {cfg.HP_STALL_S:.0f}s — restarting target search.",
-                    cooldown=cfg.BUFF_NOTIFY_COOLDOWN_S,
-                )
+                wait_s = random.uniform(cfg.SA_STALL_WAIT_MIN, cfg.SA_STALL_WAIT_MAX)
+                logger.info(f"[BOT] [{nick}] Post-burst pause {wait_s:.1f}s")
+                capslock.interruptible_sleep(wait_s)
                 return "stalled"
 
             # Full timeout
@@ -1826,6 +2456,7 @@ class FarmBot:
         self._char_anchor.invalidate()
         self._mob_dead_f.invalidate()
         self._death_f.invalidate()
+        self._disconnect_f.invalidate()
         self._buff_f.invalidate()
         self._buff_f1.invalidate()
 

@@ -486,6 +486,21 @@ class ArduinoHIDAdapter:
         self.move_to(x, y)
         return self.shift_right_click_hold(hold_min, hold_max) > 0
 
+    def drag_camera(self, dx: int, dy: int = 0, settle_s: float = 0.30):
+        import pyautogui as _pag
+        try:
+            sw, sh = _pag.size()
+        except Exception:
+            sw, sh = 1920, 1080
+        cx, cy = sw // 2, sh // 2
+        self.move_to(cx, cy)
+        time.sleep(0.05)
+        self._hid._tell(f"DRAG_RIGHT,{int(dx)},{int(dy)}")
+        time.sleep(settle_s)
+        self.move_to(cx, cy)
+        time.sleep(0.05)
+        return True
+
     def double_click_at(self, x, y, gap_min=80, gap_max=160, y_shift=0):
         import random as _rnd
         self.move_to(x, y + y_shift)

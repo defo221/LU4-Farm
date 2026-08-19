@@ -229,6 +229,32 @@ class ArduinoHID:
         self.move_to(x, y)
         return self.shift_right_click_hold(hold_min, hold_max) > 0
 
+    def drag_camera(self, dx: int, dy: int = 0, settle_s: float = 0.30):
+        """Hold RMB, drag (dx, dy) pixels from the screen centre, release RMB.
+
+        The cursor is moved to the screen centre before the drag so the full
+        pixel distance is always available regardless of where the cursor was.
+        After the drag the cursor is returned to screen centre.
+
+        dx > 0  → camera pans left  (character rotates right in L2)
+        settle_s: seconds to wait after the drag for the camera to stop moving.
+        """
+        if self._ser is None:
+            logger.warn("[ARDUINO] not connected - drag_camera skipped")
+            return False
+        try:
+            sw, sh = _pag.size()
+        except Exception:
+            sw, sh = 1920, 1080
+        cx, cy = sw // 2, sh // 2
+        self.move_to(cx, cy)
+        time.sleep(0.05)
+        self._send(f"DRAG_RIGHT,{int(dx)},{int(dy)}")
+        time.sleep(settle_s)
+        self.move_to(cx, cy)
+        time.sleep(0.05)
+        return True
+
     def double_click_at(self, x, y, gap_min=80, gap_max=160, y_shift=0):
         """Move to (x, y + y_shift) then send a single DOUBLE_CLICK command.
 
