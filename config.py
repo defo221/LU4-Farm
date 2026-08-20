@@ -169,15 +169,15 @@ PROFILE = _PROFILES[RESOLUTION]
 # ---------------------------------------------------------------------------
 # Target search
 # ---------------------------------------------------------------------------
-TARGET_NOT_FOUND_TIMEOUT = 15.0   # seconds before "no new mobs" Telegram + stop
+TARGET_NOT_FOUND_TIMEOUT = 120   # seconds before "no new mobs" Telegram + stop
 
 # ---------------------------------------------------------------------------
 # Mob HP monitoring
 # ---------------------------------------------------------------------------
 MOB_HP_LOW_PCT  = 5    # lower end of "kill zone" range
-MOB_HP_HIGH_PCT = 35    # upper end of "kill zone" range
+MOB_HP_HIGH_PCT = 30    # upper end of "kill zone" range
 
-HP_CHECK_INTERVAL   = 0.2   # seconds between mob HP reads
+HP_CHECK_INTERVAL   = 0.0   # seconds between mob HP reads
 HP_SWITCH_EVERY     = 5     # switch windows every N checks
 
 LOW_HP_TIMEOUT_MIN  = 20   # random timeout waiting for mob HP to enter range
@@ -200,7 +200,7 @@ HP_ANCHOR_MISS_LIMIT = 2   # consecutive checks without bag_mob_anchor → resta
 # ---------------------------------------------------------------------------
 # Mob death monitoring
 # ---------------------------------------------------------------------------
-DEATH_CHECK_INTERVAL = 0.03   # seconds between mob_dead image checks
+DEATH_CHECK_INTERVAL = 0.005   # seconds between mob_dead image checks
 DEATH_SWITCH_EVERY   = 5
 DEATH_TIMEOUT        = 15.0  # seconds before "waited too long to die" handling
 
@@ -267,29 +267,35 @@ ASSIST_ATTACK_INTERVAL_MAX_MS    = 100
 # Single-window assist — phase-based target acquisition (SA_*)
 # ---------------------------------------------------------------------------
 # Phase 1: single RMB click at assist_point, wait, check bag_mob_anchor
-SA_RMB_ATTEMPTS      =    3    # RMB clicks per normal-mode attempt
-SA_RMB_WAIT_MS       =  400    # ms to wait after each RMB before checking
+SA_RMB_ATTEMPTS      =    2    # RMB clicks per normal-mode attempt
+SA_RMB_WAIT_MS       =  450    # ms to wait after each RMB before checking
 
 # Phase 2: press F5, wait, check bag_mob_anchor
 SA_F5_ATTEMPTS       =    1    # F5 presses per normal-mode attempt
-SA_F5_WAIT_MS        =  400    # ms to wait after each F5 before checking
+SA_F5_WAIT_MS        =  450    # ms to wait after each F5 before checking
 
 # Phase 3: healer-area fallback when both phases 1 & 2 failed
 SA_HEALER_CLICK_AREA      =  200    # side (px) of the click area centred on healer_farm_anchor
-SA_HEALER_PRE_DELAY_MAX   =  3.0    # random 0..N second pause before starting clicks (s)
-SA_HEALER_POST_PAUSE_MIN  =  5.0    # pause after last click before F5 loop starts (s)
-SA_HEALER_POST_PAUSE_MAX  = 10.0
-SA_HEALER_CLICK_PROX_MIN  =   75    # each click ≥ this many px from the previous one
-SA_HEALER_CLICK_PROX_MAX  =  150    # each click ≤ this many px from the previous one
+SA_HEALER_PRE_DELAY_MIN   =  0.1    # minimum random pause before starting healer clicks (s)
+SA_HEALER_PRE_DELAY_MAX   =  3.0    # maximum random pause before starting healer clicks (s)
+SA_HEALER_POST_PAUSE_MIN  =  1.0    # pause after last click before F5 loop starts (s)
+SA_HEALER_POST_PAUSE_MAX  =  3.0
+SA_HEALER_CLICK_PROX_MIN  =   50    # each click ≥ this many px from the previous one
+SA_HEALER_CLICK_PROX_MAX  =  100    # each click ≤ this many px from the previous one
 # Perspective-aware vertical bounds
 SA_HEALER_UPPER_EXTEND    =   50    # max px ABOVE healer when it is in the upper screen half
 SA_HEALER_LOWER_EXTEND    =  150    # max px BELOW healer when it is in the lower screen half
 # Exclusion zone directly below the healer centre (applied on every click)
 SA_HEALER_EXCL_W          =   30    # width  of the below-healer exclusion zone (px)
 SA_HEALER_EXCL_H          =   60    # height of the below-healer exclusion zone (px)
-SA_CAMERA_ROTATE_DX       =  550    # horizontal drag distance for a 180° camera rotation
+SA_CAMERA_ROTATE_DX       =  550    # horizontal drag distance for a 180° camera rotation (blind fallback)
+# Smart camera orientation (minimap arrow detection)
+CAMERA_ORIENT_TOL_DEG    =    5    # stop correcting when |error| <= this value (deg)
+CAMERA_ORIENT_MAX_ITER   =    8    # safety cap on correction iterations
+CAMERA_ORIENT_SETTLE_S   =  0.3    # wait after each drag before re-reading arrow (s)
 # No-healer fallback (used when healer_farm_anchor is not found even after rotation)
-SA_FALLBACK_DELAY_MAX     =  3.0    # random 0..N s delay before fallback clicks (s)
+SA_FALLBACK_DELAY_MIN     =  0.1    # minimum random pause before fallback clicks (s)
+SA_FALLBACK_DELAY_MAX     =  3.0    # maximum random pause before fallback clicks (s)
 SA_FALLBACK_CLICK_AREA    =  200    # side (px) of the centered clickable square
 SA_FALLBACK_EXCL_W        =   40    # width  of centre exclusion zone for 1st click
 SA_FALLBACK_EXCL_H        =   80    # height of centre exclusion zone for 1st click
@@ -298,7 +304,7 @@ SA_FALLBACK_CLICK_PROX_MIN=   50    # min px distance between the two fallback c
 SA_FALLBACK_CLICK_PROX_MAX=  100    # max px distance between the two fallback clicks
 
 # Phase 4: approach via double-clicks when in_target_blue is too far from center
-SA_APPROACH_PX             =  200   # distance threshold (px) — closer → attack immediately
+SA_APPROACH_PX             =  100   # distance threshold (px) — closer → attack immediately
 SA_APPROACH_MAX_DCLK       =    4   # max double-clicks before attacking anyway
 # Downward corridor bias that compensates for the isometric perspective.
 # When the mob is at 3/9 o'clock the blue dots sit above the mob's ground
@@ -307,18 +313,20 @@ SA_APPROACH_MAX_DCLK       =    4   # max double-clicks before attacking anyway
 #   12/6 o'clock → 0 px offset
 #   3/9  o'clock → SA_APPROACH_DOWN_OFFSET_MAX px offset
 SA_APPROACH_DOWN_OFFSET_MAX =   40   # px — tune to your camera angle
-SA_CORRIDOR_W        =    80    # perpendicular spread of the click corridor (px).
+SA_CORRIDOR_W        =    100    # perpendicular spread of the click corridor (px).
                                # 0 = click exactly along the line from screen center
                                # to mob — recommended for isometric games where
                                # vertical offset maps to 3D depth, not sideways movement.
 # Delays between consecutive double-clicks (uniform random, ms)
-SA_DCLK_DELAY_1_MAX  = 3000    # between 1st and 2nd double-click
-SA_DCLK_DELAY_2_MAX  = 2000    # between 2nd and 3rd double-click
-SA_DCLK_DELAY_3_MAX  = 1000    # between 3rd and 4th double-click
+SA_DCLK_DELAY_1_MAX  = 2000    # between 1st and 2nd double-click
+SA_DCLK_DELAY_2_MAX  = 1000    # between 2nd and 3rd double-click
+SA_DCLK_DELAY_3_MAX  =  500    # between 3rd and 4th double-click
+# Polling interval inside approach delays: re-check distance + mob presence every N ms
+SA_APPROACH_POLL_MS  =  50    # poll interval during approach delays (ms); exits early if mob reached or mob gone
 # Character walk speed used to ensure each click is placed far enough ahead
 # that the character cannot reach it before the next double-click fires.
 # 1 px per 5 ms  =  0.2 px/ms
-SA_CHAR_SPEED_PX_PER_MS = 0.2
+SA_CHAR_SPEED_PX_PER_MS = 0.15
 
 # ---------------------------------------------------------------------------
 # NC (name-click) targeting mode

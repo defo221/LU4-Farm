@@ -196,21 +196,24 @@ static void moveBySteps(int dx, int dy) {
   }
 }
 
-// Slow stepped move used exclusively for RMB camera drags.
-// 5 px steps with 4 ms between each keeps the HID stream clearly above the
-// 1 ms USB poll interval so the game sees smooth individual movement reports.
+// Stepped move used exclusively for RMB camera drags.
+// Adjust DRAG_DELAY_MS to control camera rotation speed:
+//   0.2 ms  (delayMicroseconds(200)) – original speed, game may drop input
+//   1 ms    – 5× slower, good starting point
+//   4 ms    – 20× slower, very slow
+#define DRAG_STEP_PX  5
+#define DRAG_DELAY_MS 1
+
 static void moveByStepsSlow(int dx, int dy) {
-  const int stepSize = 5;
   int dirX = (dx > 0) ? 1 : (dx < 0) ? -1 : 0;
   int dirY = (dy > 0) ? 1 : (dy < 0) ? -1 : 0;
-
   while ((dx != 0 || dy != 0) && !shouldStop) {
-    int moveX = (dx != 0) ? dirX * min(abs(dx), stepSize) : 0;
-    int moveY = (dy != 0) ? dirY * min(abs(dy), stepSize) : 0;
+    int moveX = (dx != 0) ? dirX * min(abs(dx), DRAG_STEP_PX) : 0;
+    int moveY = (dy != 0) ? dirY * min(abs(dy), DRAG_STEP_PX) : 0;
     Mouse.move(moveX, moveY);
     dx -= moveX;
     dy -= moveY;
-    delay(4);
+    delay(DRAG_DELAY_MS);
   }
 }
 
@@ -310,9 +313,9 @@ void loop() {
     int dy = (int)argAfterComma(cmd, 2);
     shouldStop = false;
     Mouse.press(MOUSE_RIGHT);
-    delay(80);             // give the game time to register RMB before any motion
+    delay(20);
     moveByStepsSlow(dx, dy);
-    delay(50);             // hold briefly after last movement step before releasing
+    delay(20);
     Mouse.release(MOUSE_RIGHT);
   }
   else if (cmd.startsWith("CLICK_LEFT")) {

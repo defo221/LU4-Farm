@@ -605,6 +605,14 @@ class FarmBot:
         # Cleared as soon as a post-recovery RMB succeeds.
         self._sa_recovery_mode: bool = False
 
+        # Camera orientation (set from viewer UI via stream_sender).
+        # None = use the old blind SA_CAMERA_ROTATE_DX drag.
+        # When set, the two allowed orientations are:
+        #   orient_1 = self._camera_orient_1
+        #   orient_2 = (self._camera_orient_1 + 180) % 360
+        self._camera_orient_1: Optional[int] = None
+        self._orient_bank = None   # lazy-loaded minimap template bank
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -663,6 +671,7 @@ class FarmBot:
                         logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                         capslock.wait_off()
                         logger.info("[BOT] Resumed — continuing split-assist")
+                        self._sa_recovery_mode = False
                         self._invalidate_all_caches()
                         continue
                     try:
@@ -672,6 +681,7 @@ class FarmBot:
                         logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                         capslock.wait_off()
                         logger.info("[BOT] Resumed — continuing split-assist")
+                        self._sa_recovery_mode = False
                         self._invalidate_all_caches()
                         continue  # restart the outer while loop, not fall to StopBot
                 raise StopBot
@@ -684,6 +694,7 @@ class FarmBot:
                     logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                     capslock.wait_off()
                     logger.info("[BOT] Resumed — continuing cycle")
+                    self._sa_recovery_mode = False
                     self._invalidate_all_caches()
                     continue
 
@@ -703,6 +714,7 @@ class FarmBot:
                     logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                     capslock.wait_off()
                     logger.info("[BOT] Resumed — restarting from target search")
+                    self._sa_recovery_mode = False
                     self._invalidate_all_caches()
                 except CycleTimeout as e:
                     logger.warn(f"[BOT] CycleTimeout: {e}")
@@ -1333,43 +1345,142 @@ class FarmBot:
     # Single-window assist: phase-based target acquisition + approach
     # ------------------------------------------------------------------
 
-    def _rotate_camera_180(self) -> None:
-        """Rotate the in-game camera approximately 180° via a horizontal RMB drag."""
-        logger.info("[BOT] SA: rotating camera 180°")
-        self.hid.drag_camera(cfg.SA_CAMERA_ROTATE_DX)
+    # ------------------------------------------------------------------
+    # Camera orientation control
+    # ------------------------------------------------------------------
+
+    def set_camera_orient(self, deg: int) -> None:
+        """Called by stream_sender when the viewer broadcasts a new camera orientation.
+
+        Sets orient_1 to *deg*; orient_2 is always (deg + 180) % 360.
+        The template bank does not depend on the angle and is NOT invalidated.
+        """
+        self._camera_orient_1 = int(deg) % 360
+        logger.info(f"[BOT] Camera orientations updated: "
+                    f"{self._camera_orient_1}deg / "
+                    f"{(self._camera_orient_1 + 180) % 360}deg")
+
+    def _get_orient_bank(self):
+        """Lazy-load and return the minimap template bank."""
+        if self._orient_bank is None:
+            import minimap_orient as _mo
+            self._orient_bank = _mo.build_template_bank()
+            logger.info("[BOT] Minimap orientation template bank built")
+        return self._orient_bank
+
+    def _rotate_camera_smart(self) -> None:
+        """Switch the camera to the next allowed orientation.
+
+        When _camera_orient_1 is set (via viewer UI):
+          1. Detect the current minimap-arrow angle.
+          2. Choose the target: whichever of {orient_1, orient_2} is farther away.
+          3. Iteratively drag + re-detect until within ±CAMERA_ORIENT_TOL_DEG.
+
+        Falls back to the blind SA_CAMERA_ROTATE_DX drag if orientation is not
+        configured or if arrow detection fails.
+        """
+        if self._camera_orient_1 is None:
+            logger.info("[BOT] SA: camera orient not configured — blind 180 drag")
+            self.hid.drag_camera(cfg.SA_CAMERA_ROTATE_DX)
+            return
+
+        import minimap_orient as _mo
+
+        orient_1 = self._camera_orient_1
+        orient_2 = (orient_1 + 180) % 360
+        bank     = self._get_orient_bank()
+
+        def _detect() -> Optional[int]:
+            try:
+                bgr     = _mo.grab_arrow_bgr(self.sct, _mo.ARROW_REGION)
+                gray_up = _mo._upscale_gray(bgr)
+                ang, sc = _mo.match_angle(gray_up, bank)
+                logger.info(f"[BOT] SA: arrow={ang}deg score={sc:.3f}")
+                return ang
+            except Exception as exc:
+                logger.warn(f"[BOT] SA: arrow detect error — {exc}")
+                return None
+
+        cur = _detect()
+        if cur is None:
+            logger.warn("[BOT] SA: arrow detection failed — blind 180 drag")
+            self.hid.drag_camera(cfg.SA_CAMERA_ROTATE_DX)
+            return
+
+        # Choose the orientation that is farther from the current angle
+        err_1 = min((cur - orient_1) % 360, (orient_1 - cur) % 360)
+        err_2 = min((cur - orient_2) % 360, (orient_2 - cur) % 360)
+        target = orient_2 if err_1 <= err_2 else orient_1
+        logger.info(f"[BOT] SA: camera {cur}deg -> target {target}deg "
+                    f"(orient1={orient_1}, orient2={orient_2})")
+
+        for iteration in range(1, cfg.CAMERA_ORIENT_MAX_ITER + 1):
+            delta = (target - cur + 180) % 360 - 180   # signed, (-180, +180]
+            if abs(delta) <= cfg.CAMERA_ORIENT_TOL_DEG:
+                logger.info(f"[BOT] SA: camera aligned in {iteration - 1} step(s), "
+                            f"final={cur}deg err={delta:+d}deg")
+                break
+            dx = round(delta * _mo.PIXELS_PER_360 / 360)
+            logger.info(f"[BOT] SA: camera iter {iteration}: "
+                        f"delta={delta:+d}deg dx={dx:+d}px")
+            capslock.raise_if_on()
+            self.hid.drag_camera(dx, settle_s=cfg.CAMERA_ORIENT_SETTLE_S)
+            new = _detect()
+            if new is None:
+                break
+            cur = new
+        else:
+            logger.warn(f"[BOT] SA: camera align hit max iterations, final={cur}deg")
 
     def _sa_phase4(self, frame: np.ndarray) -> bool:
         """in_target_blue approach + attack (phase 4).
 
         Called once bag_mob_anchor is confirmed on *frame*.
-        Checks for in_target_blue, rotates camera if not found, then approaches
-        via double-clicks in a corridor.  Always calls _press_attack() and
-        returns True.
+
+        Flow:
+          1. Press attack immediately (start auto-attack / engage).
+          2. Find in_target_blue; rotate camera if not visible.
+          3. If already close enough: press attack again and return.
+          4. Otherwise approach via double-clicks in corridor.
+          5. Press attack again once close / after all clicks.
         """
         fh, fw = frame.shape[:2]
         sc_x, sc_y = fw // 2, fh // 2
 
+        # Step 1 — immediate attack press as soon as target is confirmed.
+        logger.info("[BOT] SA: mob confirmed — immediate attack press")
+        self._press_attack()
+        capslock.raise_if_on()
+
         def _dot_center_from(f: np.ndarray) -> Optional[Tuple[int, int]]:
+            """Detect in_target_blue OR in_target_red — both treated equally."""
             dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
                                       conf=cfg.NC_CONFIDENCE,
                                       nms_dist=cfg.NC_NMS_DIST)
+            dots += _sa_find_blue_dots(f, self._dot_red_tmpl,
+                                       conf=cfg.NC_CONFIDENCE,
+                                       nms_dist=cfg.NC_NMS_DIST)
+            if len(dots) > 1:
+                dots.sort(key=lambda p: p[0])
+                dots = _sa_nms(dots, cfg.NC_NMS_DIST)
             return _sa_blue_pair_center(dots)
 
+        frame = self._grab()   # fresh frame after the attack press
         pair_center = _dot_center_from(frame)
 
         if pair_center is None:
-            logger.info("[BOT] SA: in_target_blue not found — rotating camera")
-            self._rotate_camera_180()
+            logger.info("[BOT] SA: in_target_blue/red not found — rotating camera")
+            self._rotate_camera_smart()
             capslock.raise_if_on()
             frame = self._grab()
             pair_center = _dot_center_from(frame)
             if pair_center is None:
-                logger.info("[BOT] SA: in_target_blue still not found — normal attack")
+                logger.info("[BOT] SA: in_target_blue/red still not found — normal attack")
                 self._press_attack()
                 return True
 
         dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
-        logger.info(f"[BOT] SA: in_target_blue at {pair_center}, dist={dist:.0f}px")
+        logger.info(f"[BOT] SA: in_target_blue/red at {pair_center}, dist={dist:.0f}px")
 
         if dist < cfg.SA_APPROACH_PX:
             logger.info("[BOT] SA: close enough — attacking")
@@ -1377,7 +1488,8 @@ class FarmBot:
             return True
 
         # Approach via double-clicks in corridor.
-        # Each iteration: fresh grab → recalculate distance → click → wait.
+        # Each iteration: fresh grab → check mob still present → recalculate → click → wait.
+        pt = self._active.assist_point
         dclk_delays_max = [
             cfg.SA_DCLK_DELAY_1_MAX,
             cfg.SA_DCLK_DELAY_2_MAX,
@@ -1388,9 +1500,24 @@ class FarmBot:
 
             # Fresh grab before every click — use the latest mob position.
             frame = self._grab()
+
+            # If bag_mob_anchor vanished mid-approach: reacquire via RMB and
+            # stop all further ground-clicks for this mob.
+            self._mob_anchor.invalidate()
+            if self._mob_anchor.find(frame) is None:
+                logger.info(f"[BOT] SA: bag_mob_anchor lost at approach click"
+                            f" #{dclk_i + 1} — RMB reacquire + attack, no more clicks")
+                if pt is not None:
+                    self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+                    capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                else:
+                    logger.warn("[BOT] SA: assist_point not set — skipping RMB reacquire")
+                self._press_attack()
+                return True
+
             pair_center = _dot_center_from(frame)
             if pair_center is None:
-                logger.info("[BOT] SA: in_target_blue lost before approach"
+                logger.info("[BOT] SA: in_target_blue/red lost before approach"
                             f" click #{dclk_i + 1} — attacking")
                 break
             dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
@@ -1422,8 +1549,43 @@ class FarmBot:
                         f" at {click_pt}, dist={dist:.0f}px,"
                         f" h_factor={h_factor:.2f}, down_offset={down_px}px")
             self.hid.double_click_at(click_pt[0], click_pt[1])
+
+            # Delay split into SA_APPROACH_POLL_MS chunks.
+            # Each chunk: re-check bag_mob_anchor and distance so the bot
+            # exits immediately if the mob vanishes or the character arrives.
             if delay_max_ms > 0:
-                capslock.interruptible_sleep(random.uniform(0, delay_max_ms / 1000.0))
+                total_s   = random.uniform(0, delay_max_ms / 1000.0)
+                elapsed_s = 0.0
+                poll_s    = cfg.SA_APPROACH_POLL_MS / 1000.0
+                while elapsed_s < total_s:
+                    chunk_s = min(poll_s, total_s - elapsed_s)
+                    capslock.interruptible_sleep(chunk_s)
+                    elapsed_s += chunk_s
+
+                    frame = self._grab()
+                    self._mob_anchor.invalidate()
+                    if self._mob_anchor.find(frame) is None:
+                        logger.info(f"[BOT] SA: bag_mob_anchor lost during delay"
+                                    f" after click #{dclk_i + 1}"
+                                    " — RMB reacquire + attack, no more clicks")
+                        if pt is not None:
+                            self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+                            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                        else:
+                            logger.warn("[BOT] SA: assist_point not set"
+                                        " — skipping RMB reacquire")
+                        self._press_attack()
+                        return True
+
+                    pc = _dot_center_from(frame)
+                    if pc is not None:
+                        d = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
+                        if d < cfg.SA_APPROACH_PX:
+                            logger.info(f"[BOT] SA: reached SA_APPROACH_PX during"
+                                        f" delay after click #{dclk_i + 1}"
+                                        f" (dist={d:.0f}px) — attacking immediately")
+                            self._press_attack()
+                            return True
 
         self._press_attack()
         return True
@@ -1558,7 +1720,35 @@ class FarmBot:
 
             if found_via_f5:
                 logger.info("[BOT] SA phase-3: target via F5 — killing")
-                self._sa_phase4(frame)
+
+                def _do_kill_cycle(label: str) -> bool:
+                    """Attack + full kill cycle for one mob in the F5 chain.
+
+                    Mirrors _cycle()'s flow: phase4 → _wait_low_hp → F2 →
+                    _wait_mob_dead.  Returns False if a timeout breaks the chain
+                    so the caller can exit the sub-loop early.
+                    """
+                    self._sa_phase4(frame)
+                    hp_result = self._wait_low_hp()
+                    if hp_result == "dead":
+                        logger.info(f"[BOT] SA phase-3 {label}: mob died early"
+                                    " — skipping finisher")
+                        return True
+                    if hp_result == "timeout":
+                        logger.info(f"[BOT] SA phase-3 {label}: HP wait timeout"
+                                    " — breaking F5 chain")
+                        return False
+                    # "ok" or "stalled" — press finisher and wait for death
+                    _press(self.hid, "f2")
+                    logger.info(f"[BOT] F2 in '{self._active.title}'")
+                    self._wait_mob_dead()
+                    return True
+
+                if not _do_kill_cycle("kill #1"):
+                    pre_delay = random.uniform(cfg.SA_HEALER_PRE_DELAY_MIN,
+                                               cfg.SA_HEALER_PRE_DELAY_MAX)
+                    capslock.interruptible_sleep(pre_delay)
+                    return False
 
                 # F5-kill sub-loop: keep pressing F5 until no more targets
                 kill_n = 1
@@ -1571,14 +1761,16 @@ class FarmBot:
                     if self._mob_anchor.find(frame) is not None:
                         kill_n += 1
                         logger.info(f"[BOT] SA phase-3: F5 kill #{kill_n}")
-                        self._sa_phase4(frame)
+                        if not _do_kill_cycle(f"kill #{kill_n}"):
+                            break
                     else:
                         logger.info(
                             f"[BOT] SA phase-3: F5 chain done after {kill_n} kill(s)")
                         break
 
                 # Wait before returning to healer stage
-                pre_delay = random.uniform(0, cfg.SA_HEALER_PRE_DELAY_MAX)
+                pre_delay = random.uniform(cfg.SA_HEALER_PRE_DELAY_MIN,
+                                           cfg.SA_HEALER_PRE_DELAY_MAX)
                 logger.info(
                     f"[BOT] SA phase-3: pre-healer wait {pre_delay:.1f}s")
                 capslock.interruptible_sleep(pre_delay)
@@ -1608,7 +1800,7 @@ class FarmBot:
         ex_hh = cfg.SA_FALLBACK_EXCL_H  // 2   # exclusion half-height
 
         # ---- Pre-delay ---------------------------------------------------------
-        delay = random.uniform(0, cfg.SA_FALLBACK_DELAY_MAX)
+        delay = random.uniform(cfg.SA_FALLBACK_DELAY_MIN, cfg.SA_FALLBACK_DELAY_MAX)
         logger.info(f"[BOT] SA fallback: pre-delay {delay:.1f}s")
         capslock.interruptible_sleep(delay)
 
@@ -1699,7 +1891,7 @@ class FarmBot:
             if healer_pos is None:
                 logger.info(
                     "[BOT] SA phase-3: healer anchor not found — rotating camera")
-                self._rotate_camera_180()
+                self._rotate_camera_smart()
                 capslock.raise_if_on()
                 frame = self._grab()
                 if self._healer_anchor is not None:
@@ -1716,12 +1908,13 @@ class FarmBot:
                     continue
 
             # ---- Healer anchor found -------------------------------------------
-            pre_delay = random.uniform(0, cfg.SA_HEALER_PRE_DELAY_MAX)
+            pre_delay = random.uniform(cfg.SA_HEALER_PRE_DELAY_MIN,
+                                       cfg.SA_HEALER_PRE_DELAY_MAX)
             logger.info(f"[BOT] SA phase-3: healer at {healer_pos},"
                         f" pre-delay {pre_delay:.1f}s")
             capslock.interruptible_sleep(pre_delay)
 
-            clicks = random.randint(1, 3)
+            clicks = random.randint(1, 2)
             logger.info(f"[BOT] SA phase-3: {clicks} click(s) in"
                         f" {cfg.SA_HEALER_CLICK_AREA}px area")
 
@@ -1808,16 +2001,32 @@ class FarmBot:
 
         if not self._sa_recovery_mode:
             # ---- Phase 1: SA_RMB_ATTEMPTS RMB clicks ---------------------------
-            for i in range(cfg.SA_RMB_ATTEMPTS):
+            # If mob_dead is still visible after an RMB click the bot latched
+            # onto the stale dead-mob target bar.  Keep clicking until the
+            # death indicator clears before counting real Phase-1 attempts.
+            real_rmb = 0
+            while real_rmb < cfg.SA_RMB_ATTEMPTS:
                 capslock.raise_if_on()
                 if pt is not None:
-                    logger.info(
-                        f"[BOT] SA phase-1 RMB #{i + 1}/{cfg.SA_RMB_ATTEMPTS}")
                     self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
                 else:
                     logger.warn("[BOT] SA: assist_point not set — skipping RMB")
                 capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
                 frame = self._grab()
+
+                # Stale-target guard: if the death overlay is still on screen
+                # the previous mob hasn't been cleared yet — repeat without
+                # consuming a Phase-1 slot.
+                self._mob_dead_f.invalidate()
+                if self._mob_dead_f.find(frame, silent=True) is not None:
+                    logger.info(
+                        "[BOT] SA phase-1: mob_dead still visible"
+                        " — stale target, repeating RMB (not counted)")
+                    continue  # real_rmb unchanged
+
+                real_rmb += 1
+                logger.info(
+                    f"[BOT] SA phase-1 RMB #{real_rmb}/{cfg.SA_RMB_ATTEMPTS}")
                 self._mob_anchor.invalidate()
                 if self._mob_anchor.find(frame) is not None:
                     logger.info("[BOT] SA: bag_mob_anchor found after RMB")

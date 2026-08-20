@@ -827,6 +827,14 @@ class Session:
                 self.viewer_manual.clear()
             return
 
+        if t == "camera_orient":
+            # Viewer is broadcasting the first allowed camera orientation.
+            # orient_2 = (orient_1 + 180) % 360 — computed by the bot.
+            deg = int(cmd.get("deg", 0)) % 360
+            if self._bot is not None:
+                self._bot.set_camera_orient(deg)
+            return
+
         if not self.hid.connected:
             self.chan.send_json({"t": "error", "msg": "Arduino not connected; "
                                                       "input refused"})

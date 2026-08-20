@@ -1,7 +1,7 @@
 {
   "bot.py": {
-    "sha256": "f09c9745523f5fc075db7a499a316ae470e9c8fc0effcdf7cef70906a8def3a3",
-    "size": 118668
+    "sha256": "bc2bb9e63dcf1a3564e029b75b4b07cb58ed35cb5c08ba8e4a746de158242405",
+    "size": 127521
   },
   "hotkey_assist.py": {
     "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
@@ -68,8 +68,8 @@
     "size": 175
   },
   "updater.py": {
-    "sha256": "3737bdfbedb9a8266602760c59e0bbb14ad8eafba30eabf7b759b3d46a3fe233",
-    "size": 19499
+    "sha256": "8cee9bfe87534dd4a2236151edf5629b24a8c09ef90fca5eb4d03f9bd91684fd",
+    "size": 19617
   },
   "make_manifest.bat": {
     "sha256": "ed9bfc75cacabba73e1a64e5e7dc8e77e8e8bfb56f662981588d4b8ee696579f",
@@ -92,20 +92,36 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "1382e158e074a74c413533fc45d03631717203f235ef7dfcd295b809217ea2d4",
-    "size": 47582
+    "sha256": "6603251e126c924dce70ed633274050f2fcfa5ad832a1236019c4f63b719839e",
+    "size": 47925
   },
   "stream_viewer.py": {
-    "sha256": "1ceed5d42c8c111c35d5010a8af9b020338d9c91b0a3d25576d085f7a800857f",
-    "size": 59027
+    "sha256": "3d8b6336f84c5cb9b1e048025f46c6ac397a3edbe64fe8764512d643310dd184",
+    "size": 61483
+  },
+  "minimap_orient.py": {
+    "sha256": "0bcefb779fa836b8a3e681e51df52e09ac6a148094264df6dfe8d4c4e2372634",
+    "size": 16112
   },
   "bench_capture.py": {
     "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
     "size": 7705
   },
+  "minimap_orient.bat": {
+    "sha256": "59904ed13cd491f2ff6788134a923a1e58e8eb1d9c551c64263455e36df661ef",
+    "size": 71
+  },
+  "minimap_align.bat": {
+    "sha256": "f2974afd3daa090e0809e24b48915ef1efe0e9af62ab388284529bfe41ccb818",
+    "size": 75
+  },
   "run_stream_sender.bat": {
     "sha256": "1d043011e19f7ba509b89ab55023130ad824ae87ba47f019cde7aff4cf86cd03",
     "size": 1722
+  },
+  "run_stream_sender_with_bot.bat": {
+    "sha256": "fa90ea8df3721427d6038f1991370de2489027805b24583a158d359fe666e1e2",
+    "size": 736
   },
   "run_stream_viewer.bat": {
     "sha256": "85d036637abf4cabe5eac183806aae7db298abe18800c941e0fcc304c1e0878b",
@@ -120,8 +136,8 @@
     "size": 2235
   },
   "mouse.ino": {
-    "sha256": "51a2c12a0e4f5ad5f49cd3cdf5c7336087352a2c0cf408dd4f1bc99dd6795899",
-    "size": 16588
+    "sha256": "c3e1eccd6d8a0652ec72855365bac9bbf573a96b234945f6cc8767a7944ff2a2",
+    "size": 16560
   },
   "l2cursor.cur": {
     "sha256": "54cb10aff82f637f159577a3c37c5e658dc1f4d03ca441f9ef12a2d726810735",
@@ -135,13 +151,33 @@
     "sha256": "da949a3c7af25602fafb1cc05ec5d4c619798ce81d78da6751e85d5c2c1a6377",
     "size": 599
   },
+  "assets/asus/death_screen.png": {
+    "sha256": "000e3f90635c71c7b54afc3eae411450f86f8a2fd526adcce5664db03637f1ce",
+    "size": 1298
+  },
+  "assets/asus/full_buff_check.png": {
+    "sha256": "9722d604b47ee594c57a35f69a2078dc3a1e0ef9df753a6a27400ccc0862bb45",
+    "size": 1239
+  },
+  "assets/asus/full_buff_check1.png": {
+    "sha256": "cab1941d8edea4280f0a2ec45bc1c78f03f7d790c0528834d010b880d69e4cf5",
+    "size": 2097
+  },
+  "assets/asus/healer_farm_anchor.png": {
+    "sha256": "5e116b5aee555205e10e89b14a1e8113c3f75c11d1fe06ac31e5e551a08506de",
+    "size": 970
+  },
+  "assets/asus/in_target_blue.png": {
+    "sha256": "907521a3471bab73d3cc79957b93183a7fd405716a36038ab5de62d78836d38a",
+    "size": 623
+  },
   "assets/asus/mob_dead.png": {
     "sha256": "44978b2814076b1d5770135a7798882bcfb49c73a65514aaa75faadea7b71ca0",
     "size": 3302
   },
   "assets/asus/party_pl_anchor.png": {
-    "sha256": "cefa619189d1c8929c197b8217562ca8e33a452dc1186b405bc1a4353c243468",
-    "size": 2629
+    "sha256": "aea3eae621f13fcfd2af085145e4ec0ef4d8d7c3cc5078713f0c43818efa33b0",
+    "size": 1064
   },
   "assets/bag_mob_anchor.png": {
     "sha256": "d08ee591e3dc58b611142df84e0db3043fab8cb2c2d54c75d6b102f2c9111ca2",
@@ -154,6 +190,10 @@
   "assets/death_screen.png": {
     "sha256": "780ae285ce12217b81ab2009fa618d701deaf24998748200cc9c7384623c943d",
     "size": 2058
+  },
+  "assets/disconnect.png": {
+    "sha256": "8d26f5d0953136063050952cc5a87e08ce869cafd9cd87205b66f25b35933ff7",
+    "size": 4023
   },
   "assets/full_buff_check.png": {
     "sha256": "867a28ea0f7be411e033cb705124c73c002ddf331cfb64d6e600967446268d1c",
@@ -186,6 +226,10 @@
   "assets/fullhd/in_target_blue.png": {
     "sha256": "ba440ff81bae156666264a942d28a6797cf7d9fcaffb2fd18aa93ca21d9aacb8",
     "size": 544
+  },
+  "assets/fullhd/in_target_red.png": {
+    "sha256": "43c7148f93e7736f2e2feda0b6e4202571f7319bb159bfef4eb164d0379c27e0",
+    "size": 599
   },
   "assets/fullhd/mob_dead.png": {
     "sha256": "1acad251d7a946bb5dcc8709e7f2a898b8c364c351785642c4551984d66e5d56",
@@ -232,9 +276,9 @@
     "size": 468
   },
   "config.py": {
-    "sha256": "0d05af343de01bb962b1c8923fe849a936dd6f508b20ee8e387e0e8e7f03b4ff",
-    "shared_sha256": "6eded1ff798af9378e1dbdf5ec8b406d3cffe3d6f1a131b18341d4ab1d22a28b",
-    "size": 19298,
+    "sha256": "97f29c389e2ba16bf764e47f717f3d6cbf2d24e322b9687dca060c3f55f63ee7",
+    "shared_sha256": "82f88730eaafa541544ea926a8972765dce953c826a9de49e4ca387a47ed4bf8",
+    "size": 19817,
     "partial_update": true
   }
 }

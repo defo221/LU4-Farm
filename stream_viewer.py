@@ -436,9 +436,37 @@ class Viewer:
                                 cursor="none")
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        self.status = tk.Label(root, anchor="w", bg="#1c1c1c", fg="#d0d0d0",
+        # Status bar: existing label on the left + camera orient control on the right.
+        _sb = tk.Frame(root, bg="#1c1c1c")
+        _sb.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.status = tk.Label(_sb, anchor="w", bg="#1c1c1c", fg="#d0d0d0",
                                font=("Consolas", 9), padx=6)
-        self.status.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status.pack(side="left", fill="both", expand=True)
+
+        # ── Camera orientation control (right side of status bar) ──────────────
+        _co = tk.Frame(_sb, bg="#1c1c1c")
+        _co.pack(side="right", padx=(0, 10))
+        tk.Label(_co, text="Cam orient:", bg="#1c1c1c", fg="#666666",
+                 font=("Consolas", 9)).pack(side="left")
+        self._orient_var  = tk.StringVar(value="0")
+        self._orient2_var = tk.StringVar(value="180")
+        _ent = tk.Entry(_co, textvariable=self._orient_var, width=4,
+                        bg="#1a1a1a", fg="#3fa7ff", insertbackground="#3fa7ff",
+                        font=("Consolas", 9), bd=0,
+                        highlightthickness=1,
+                        highlightcolor="#3fa7ff",
+                        highlightbackground="#2a2a2a",
+                        relief="flat")
+        _ent.pack(side="left", padx=(5, 2), ipady=1)
+        tk.Label(_co, text="/", bg="#1c1c1c", fg="#444444",
+                 font=("Consolas", 9)).pack(side="left")
+        tk.Label(_co, textvariable=self._orient2_var, bg="#1c1c1c", fg="#555555",
+                 font=("Consolas", 9), width=4).pack(side="left", padx=(2, 0))
+        tk.Label(_co, text="deg  [Enter]", bg="#1c1c1c", fg="#444444",
+                 font=("Consolas", 8)).pack(side="left", padx=(4, 0))
+        _ent.bind("<Return>",   lambda e: self._apply_orient())
+        _ent.bind("<FocusOut>", lambda e: self.canvas.focus_set())
 
         # Fixed-size L2 cursor that follows the viewer's own mouse.
         # Converted once at startup; never rescaled so size is constant
@@ -455,10 +483,33 @@ class Viewer:
         else:
             self._cur_photo = None
 
+        self._orient_1: int = 0   # orient_2 = (orient_1 + 180) % 360
+
         self._bind()
         for l in links:
             l.start()
         self._tick()
+
+    # ---- camera orientation control ----
+    def _apply_orient(self):
+        """Validate entry, update labels, broadcast to all tile links."""
+        raw = (self._orient_var.get() if self._orient_var else "").strip()
+        try:
+            deg = int(raw) % 360
+        except ValueError:
+            if self._orient_var:
+                self._orient_var.set(str(self._orient_1))
+            self.canvas.focus_set()
+            return
+        self._orient_1 = deg
+        if self._orient_var:
+            self._orient_var.set(str(deg))
+        if self._orient2_var:
+            self._orient2_var.set(str((deg + 180) % 360))
+        msg = {"t": "camera_orient", "deg": deg}
+        for t in self.tiles:
+            t.link.send(msg)
+        self.canvas.focus_set()
 
     # ---- bindings ----
     def _bind(self):
@@ -521,6 +572,7 @@ class Viewer:
         for t in self.tiles:
             if t.rect[2] > 0:
                 t.link.set_scale_for(t.rect[2] - 2 * TILE_BORDER)
+
 
     def _layout_special(self, w, h):
         """Layout for up to 8 tiles (7 game + 1 controls ★).
