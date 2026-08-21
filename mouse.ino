@@ -252,6 +252,7 @@ void loop() {
     int dx = (int)argAfterComma(cmd, 1);
     int dy = (int)argAfterComma(cmd, 2);
     moveBySteps(dx, dy);
+    Serial.println("OK");   // notify host that all HID reports were sent
   }
   else if (cmd.startsWith("CLICK_LEFT_HOLD")) {
     long hmin = argAfterComma(cmd, 1);

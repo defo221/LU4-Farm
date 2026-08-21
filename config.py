@@ -267,7 +267,7 @@ ASSIST_ATTACK_INTERVAL_MAX_MS    = 100
 # Single-window assist — phase-based target acquisition (SA_*)
 # ---------------------------------------------------------------------------
 # Phase 1: single RMB click at assist_point, wait, check bag_mob_anchor
-SA_RMB_ATTEMPTS      =    2    # RMB clicks per normal-mode attempt
+SA_RMB_ATTEMPTS      =    3    # RMB clicks per normal-mode attempt
 SA_RMB_WAIT_MS       =  450    # ms to wait after each RMB before checking
 
 # Phase 2: press F5, wait, check bag_mob_anchor
@@ -277,15 +277,12 @@ SA_F5_WAIT_MS        =  450    # ms to wait after each F5 before checking
 # Phase 3: healer-area fallback when both phases 1 & 2 failed
 SA_HEALER_CLICK_AREA      =  200    # side (px) of the click area centred on healer_farm_anchor
 SA_HEALER_PRE_DELAY_MIN   =  0.1    # minimum random pause before starting healer clicks (s)
-SA_HEALER_PRE_DELAY_MAX   =  3.0    # maximum random pause before starting healer clicks (s)
+SA_HEALER_PRE_DELAY_MAX   =  2.0    # maximum random pause before starting healer clicks (s)
 SA_HEALER_POST_PAUSE_MIN  =  1.0    # pause after last click before F5 loop starts (s)
 SA_HEALER_POST_PAUSE_MAX  =  3.0
 SA_HEALER_CLICK_PROX_MIN  =   50    # each click ≥ this many px from the previous one
 SA_HEALER_CLICK_PROX_MAX  =  100    # each click ≤ this many px from the previous one
-# Perspective-aware vertical bounds
-SA_HEALER_UPPER_EXTEND    =   50    # max px ABOVE healer when it is in the upper screen half
-SA_HEALER_LOWER_EXTEND    =  150    # max px BELOW healer when it is in the lower screen half
-# Exclusion zone directly below the healer centre (applied on every click)
+# Exclusion zone directly below the healer centre (upper-half anchor only)
 SA_HEALER_EXCL_W          =   30    # width  of the below-healer exclusion zone (px)
 SA_HEALER_EXCL_H          =   60    # height of the below-healer exclusion zone (px)
 SA_CAMERA_ROTATE_DX       =  550    # horizontal drag distance for a 180° camera rotation (blind fallback)
@@ -295,7 +292,7 @@ CAMERA_ORIENT_MAX_ITER   =    8    # safety cap on correction iterations
 CAMERA_ORIENT_SETTLE_S   =  0.3    # wait after each drag before re-reading arrow (s)
 # No-healer fallback (used when healer_farm_anchor is not found even after rotation)
 SA_FALLBACK_DELAY_MIN     =  0.1    # minimum random pause before fallback clicks (s)
-SA_FALLBACK_DELAY_MAX     =  3.0    # maximum random pause before fallback clicks (s)
+SA_FALLBACK_DELAY_MAX     =  2.0    # maximum random pause before fallback clicks (s)
 SA_FALLBACK_CLICK_AREA    =  200    # side (px) of the centered clickable square
 SA_FALLBACK_EXCL_W        =   40    # width  of centre exclusion zone for 1st click
 SA_FALLBACK_EXCL_H        =   80    # height of centre exclusion zone for 1st click
@@ -304,29 +301,68 @@ SA_FALLBACK_CLICK_PROX_MIN=   50    # min px distance between the two fallback c
 SA_FALLBACK_CLICK_PROX_MAX=  100    # max px distance between the two fallback clicks
 
 # Phase 4: approach via double-clicks when in_target_blue is too far from center
-SA_APPROACH_PX             =  100   # distance threshold (px) — closer → attack immediately
-SA_APPROACH_MAX_DCLK       =    4   # max double-clicks before attacking anyway
+# SA_ATTACK_BEFORE_APPROACH:
+#   True  — press ASSIST_ATTACK_COUNT immediately when the target is confirmed,
+#            then approach (current / original behaviour).
+#   False — skip the initial attack press; if the mob is already within
+#            SA_APPROACH_PX just attack once; otherwise approach first and
+#            only attack after the character is close enough.
+SA_ATTACK_BEFORE_APPROACH  = True
+# Pre-attack delay when SA_ATTACK_BEFORE_APPROACH = True.
+# For each new mob: 90 % chance → uniform [MIN, MAX] seconds before pressing
+# ASSIST_ATTACK_COUNT; 10 % chance → a longer [LONG_MIN, LONG_MAX] interval.
+SA_PRE_ATTACK_DELAY_MIN      =  0.0  # normal delay lower bound (s)
+SA_PRE_ATTACK_DELAY_MAX      =  1  # normal delay upper bound (s)
+SA_PRE_ATTACK_DELAY_LONG_MIN =  1.5  # long-delay lower bound (s)
+SA_PRE_ATTACK_DELAY_LONG_MAX =  3.0  # long-delay upper bound (s)
+SA_PRE_ATTACK_LONG_CHANCE    =  0.10 # probability (0–1) of using the long delay
+SA_APPROACH_SKIP_PX        =  120   # before approach: if mob already within this distance, skip
+                               #   all ground clicks and attack immediately
+SA_APPROACH_STOP_PX        =  300   # during approach polling: if mob closes to within this
+                               #   distance, stop remaining clicks and attack immediately
+SA_APPROACH_MIN_DCLK       =    1   # min double-clicks chosen upfront per mob
+SA_APPROACH_MAX_DCLK       =    4   # max double-clicks chosen upfront per mob
 # Downward corridor bias that compensates for the isometric perspective.
 # When the mob is at 3/9 o'clock the blue dots sit above the mob's ground
 # position; shifting the corridor target down brings clicks closer to the
 # actual body.  Scales with abs(sin(angle_from_vertical)) = |ux|:
 #   12/6 o'clock → 0 px offset
 #   3/9  o'clock → SA_APPROACH_DOWN_OFFSET_MAX px offset
-SA_APPROACH_DOWN_OFFSET_MAX =   40   # px — tune to your camera angle
-SA_CORRIDOR_W        =    100    # perpendicular spread of the click corridor (px).
+SA_APPROACH_DOWN_OFFSET_MAX =   35   # px — tune to your camera angle
+SA_CORRIDOR_W        =    80    # perpendicular spread of the click corridor (px).
                                # 0 = click exactly along the line from screen center
                                # to mob — recommended for isometric games where
                                # vertical offset maps to 3D depth, not sideways movement.
-# Delays between consecutive double-clicks (uniform random, ms)
-SA_DCLK_DELAY_1_MAX  = 2000    # between 1st and 2nd double-click
-SA_DCLK_DELAY_2_MAX  = 1000    # between 2nd and 3rd double-click
-SA_DCLK_DELAY_3_MAX  =  500    # between 3rd and 4th double-click
-# Polling interval inside approach delays: re-check distance + mob presence every N ms
-SA_APPROACH_POLL_MS  =  50    # poll interval during approach delays (ms); exits early if mob reached or mob gone
-# Character walk speed used to ensure each click is placed far enough ahead
-# that the character cannot reach it before the next double-click fires.
-# 1 px per 5 ms  =  0.2 px/ms
-SA_CHAR_SPEED_PX_PER_MS = 0.15
+SA_CORRIDOR_MAX_RATIO =  0.60  # clicks are placed at most this fraction of the
+                               # total distance from screen centre to the mob.
+                               # 0.85 = stop 15% short of the mob to avoid overshooting.
+# Distance-driven click timing (replaces fixed per-click delays)
+# After each double-click, the bot polls at SA_APPROACH_POLL_MS intervals and
+# fires the next click once the character has closed to within
+#   d_now  ≤  d_remaining + SA_NEXT_CLICK_LEAD_PX
+# where d_remaining = pixel distance from the click point to the mob's dot
+# centre at the moment of clicking, and d_now = current distance from screen
+# centre to the mob's dot centre.
+SA_NEXT_CLICK_LEAD_PX    =   250   # px lead before the next click fires
+SA_APPROACH_POLL_MS      =   50   # poll interval (ms) during approach
+SA_APPROACH_MAX_WAIT_MIN_MS  = 5000   # safety cap: min ms to wait per click before giving up
+SA_APPROACH_MAX_WAIT_MAX_MS  = 8000   # safety cap: max ms to wait per click before giving up
+# Minimum distance from screen centre that a click must be placed.
+# Prevents placing clicks so close that the character arrives before the
+# next poll cycle can even fire.
+SA_FIRST_CLICK_MIN_PX    =  150   # minimum px for the very first click in the series
+SA_NEXT_CLICK_MIN_PX     =  100   # minimum px for all subsequent clicks
+# Final fallback click after all SA_APPROACH_MAX_DCLK clicks are exhausted
+# without reaching SA_APPROACH_PX.  One double-click is placed in a
+# SA_APPROACH_FINAL_AREA × SA_APPROACH_FINAL_AREA box below the dot centre,
+# excluding a SA_APPROACH_FINAL_EXCL_W × SA_APPROACH_FINAL_EXCL_H zone
+# directly at/below the dot centre.  Then the bot waits 3–5 s for the
+# character to arrive before attacking regardless.
+SA_APPROACH_FINAL_AREA         = 100   # px – side of the click area below the dot
+SA_APPROACH_FINAL_EXCL_W       =  20   # px – exclusion zone width  around dot centre
+SA_APPROACH_FINAL_EXCL_H       =  40   # px – exclusion zone height below dot centre
+SA_APPROACH_FINAL_WAIT_MIN_MS  = 3000  # ms – minimum wait after final fallback click
+SA_APPROACH_FINAL_WAIT_MAX_MS  = 5000  # ms – maximum wait after final fallback click
 
 # ---------------------------------------------------------------------------
 # NC (name-click) targeting mode

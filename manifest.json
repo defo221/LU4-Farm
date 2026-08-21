@@ -1,147 +1,23 @@
 {
-  "bot.py": {
-    "sha256": "bc2bb9e63dcf1a3564e029b75b4b07cb58ed35cb5c08ba8e4a746de158242405",
-    "size": 127521
+  ".gitignore": {
+    "sha256": "4eb8a850c1cec808784a80bdcb63ffa99048e62a5f73b85e12edd25034764e5c",
+    "size": 35
   },
-  "hotkey_assist.py": {
-    "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
-    "size": 20400
+  ".last_msg_id": {
+    "sha256": "4a8e6d5dd4d03e4cb6a690bce6e1e0d390e7b047a46fa6209585bc5743caae5d",
+    "size": 4
+  },
+  ".tg_api_creds": {
+    "sha256": "163af2b931a75b6d14aef11aa3aa6576907fcb76a45f2394e4947b8fec3bc1f5",
+    "size": 44
+  },
+  ".tg_user_session.session": {
+    "sha256": "9f4d185ff3d13da8a4c523c332c255f413c75496b8a25652fb5d4bfff0b42655",
+    "size": 28672
   },
   "arduino_hid.py": {
     "sha256": "78702967c52c743c2c6cc7e871cd89631333305a24c81f6dfd0b7d395b45f20b",
     "size": 12735
-  },
-  "vision.py": {
-    "sha256": "0f76aa6a3688babca22319086000235dd036a6f1c7b13fa54781d667b8843df5",
-    "size": 5539
-  },
-  "window_manager.py": {
-    "sha256": "f87f7449020e510132013f056a5c78c20e4e43c5c69f72c80123bab605b06429",
-    "size": 10555
-  },
-  "logger.py": {
-    "sha256": "49dbc0a9e4be51a45a9c5d815ead22cbc46439400bf04e607f6b769933473f8c",
-    "size": 4576
-  },
-  "notifier.py": {
-    "sha256": "ace95de2e7fa0392585a618a70e71d1876b72278ff9a72b26f47105a8798a816",
-    "size": 5777
-  },
-  "capslock.py": {
-    "sha256": "193fb40114fcd0f02df18456dc5d63002e415babca3aa38a44c6b32d759a8863",
-    "size": 3901
-  },
-  "hp_monitor.py": {
-    "sha256": "301878d96ce229814f6f0052a62aa1dc222f130bbb4eadadd95144b1ff4f7b84",
-    "size": 8801
-  },
-  "input_recorder.py": {
-    "sha256": "740080848346d2466f14676a061f2f20ccbd12146826ad211c1e784872845188",
-    "size": 11663
-  },
-  "rmb_anchor_timer.py": {
-    "sha256": "6161c62b2ea14772b7ee2c59e82b680d01dfdbc3bc9b357d7f0827ea65392b5f",
-    "size": 12247
-  },
-  "debug_templates.py": {
-    "sha256": "355f7d6f2225e9974660de66c27f242e8dc260ad83cf0465f91192f60c784130",
-    "size": 1252
-  },
-  "run_bot.bat": {
-    "sha256": "b962e4aac3ce9e4a95a5a9fb1bad8018be3ea303f775b3b24a1753c6b7432033",
-    "size": 329
-  },
-  "run_hotkey_assist.bat": {
-    "sha256": "14fa74507498b2a79d2ab5ee13f59bd2fd133b88b98573e994e0a581a5225d77",
-    "size": 378
-  },
-  "run_hp_monitor.bat": {
-    "sha256": "d17aa713cf75264cfd031f8514962d3eb159bb0ab695c237bdbed15312f4b298",
-    "size": 374
-  },
-  "run_recorder.bat": {
-    "sha256": "c58720720f5761455974eff644cd04f6dfd484cd86e668eafbf0e9e17992c827",
-    "size": 59
-  },
-  "run_rmb_timer.bat": {
-    "sha256": "214f072590476b0b459fd758a53645f1d16d4d13817af57a556e7e4dcbb74778",
-    "size": 175
-  },
-  "updater.py": {
-    "sha256": "8cee9bfe87534dd4a2236151edf5629b24a8c09ef90fca5eb4d03f9bd91684fd",
-    "size": 19617
-  },
-  "make_manifest.bat": {
-    "sha256": "ed9bfc75cacabba73e1a64e5e7dc8e77e8e8bfb56f662981588d4b8ee696579f",
-    "size": 197
-  },
-  "run_updater.bat": {
-    "sha256": "238a651d852a99d408a4754c50c00eb7401523676ff9b1fdfdf5cf9acb20a319",
-    "size": 414
-  },
-  "start_fileserver.bat": {
-    "sha256": "928f65c16515a0a9ad65593cab41339a5ce2da072554895e0337e3046ac84b2c",
-    "size": 929
-  },
-  "fileserver.py": {
-    "sha256": "c8959aef99b7d14c3a2b07715b33b1cd864fd50fadc592cfbfb790b65a83fbf2",
-    "size": 8602
-  },
-  "stream_proto.py": {
-    "sha256": "cffa43e90774aa7864926f8ca6f3e6724287de2d7b51ebb8f479337e90a56f42",
-    "size": 8230
-  },
-  "stream_sender.py": {
-    "sha256": "6603251e126c924dce70ed633274050f2fcfa5ad832a1236019c4f63b719839e",
-    "size": 47925
-  },
-  "stream_viewer.py": {
-    "sha256": "3d8b6336f84c5cb9b1e048025f46c6ac397a3edbe64fe8764512d643310dd184",
-    "size": 61483
-  },
-  "minimap_orient.py": {
-    "sha256": "0bcefb779fa836b8a3e681e51df52e09ac6a148094264df6dfe8d4c4e2372634",
-    "size": 16112
-  },
-  "bench_capture.py": {
-    "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
-    "size": 7705
-  },
-  "minimap_orient.bat": {
-    "sha256": "59904ed13cd491f2ff6788134a923a1e58e8eb1d9c551c64263455e36df661ef",
-    "size": 71
-  },
-  "minimap_align.bat": {
-    "sha256": "f2974afd3daa090e0809e24b48915ef1efe0e9af62ab388284529bfe41ccb818",
-    "size": 75
-  },
-  "run_stream_sender.bat": {
-    "sha256": "1d043011e19f7ba509b89ab55023130ad824ae87ba47f019cde7aff4cf86cd03",
-    "size": 1722
-  },
-  "run_stream_sender_with_bot.bat": {
-    "sha256": "fa90ea8df3721427d6038f1991370de2489027805b24583a158d359fe666e1e2",
-    "size": 736
-  },
-  "run_stream_viewer.bat": {
-    "sha256": "85d036637abf4cabe5eac183806aae7db298abe18800c941e0fcc304c1e0878b",
-    "size": 285
-  },
-  "setup_slave_firewall.bat": {
-    "sha256": "9811c7fe2f17e0ba78a371c9dbddb900a71e0f4ebb223fd73264ff490dc30936",
-    "size": 828
-  },
-  "setup_slave_firewall.ps1": {
-    "sha256": "781aedf9824db2c2cb0376943c3e69f3a8f55aebc6080e280d3ecebbf8f29366",
-    "size": 2235
-  },
-  "mouse.ino": {
-    "sha256": "c3e1eccd6d8a0652ec72855365bac9bbf573a96b234945f6cc8767a7944ff2a2",
-    "size": 16560
-  },
-  "l2cursor.cur": {
-    "sha256": "54cb10aff82f637f159577a3c37c5e658dc1f4d03ca441f9ef12a2d726810735",
-    "size": 2238
   },
   "assets/asus/bag_mob_anchor.png": {
     "sha256": "258d7b4b4ec7e8357f4fe0b7828c333311204ba1d5c6e1be1069bb7e5b3f2440",
@@ -178,6 +54,14 @@
   "assets/asus/party_pl_anchor.png": {
     "sha256": "aea3eae621f13fcfd2af085145e4ec0ef4d8d7c3cc5078713f0c43818efa33b0",
     "size": 1064
+  },
+  "assets/asus_char_bars.png": {
+    "sha256": "5d92ffa4a854afb3fad771ffbd27686bdc8c5634995c34f5c006ea9375061e72",
+    "size": 64118
+  },
+  "assets/asus_mob_bars.png": {
+    "sha256": "f20a86e6d81433f872862171b2738c79f3a5ac80a6489715ec4cd2660e8115fe",
+    "size": 55729
   },
   "assets/bag_mob_anchor.png": {
     "sha256": "d08ee591e3dc58b611142df84e0db3043fab8cb2c2d54c75d6b102f2c9111ca2",
@@ -271,14 +155,210 @@
     "sha256": "34c07741b967e1e97da2c3cf1448cab8fe4428e624cf2b302cad29f0cd1804c9",
     "size": 1081
   },
+  "assets/open_bag.png": {
+    "sha256": "d08ee591e3dc58b611142df84e0db3043fab8cb2c2d54c75d6b102f2c9111ca2",
+    "size": 1132
+  },
   "assets/party_pl_anchor.png": {
     "sha256": "db2ac25c17825d1905c667975cbf53eb59128cb80e5a76f4c168766956b26cd0",
     "size": 468
   },
+  "bench_capture.py": {
+    "sha256": "5d1ff7748fabdb9b1743e7ca0c010d98a596bb9e03b5bed6caa18cc02249931d",
+    "size": 7705
+  },
+  "bot.py": {
+    "sha256": "c66bc3eee7260b3e4e57dd71060c48eaff4632993a6bdb918620f4c1478c883e",
+    "size": 135326
+  },
+  "capslock.py": {
+    "sha256": "193fb40114fcd0f02df18456dc5d63002e415babca3aa38a44c6b32d759a8863",
+    "size": 3901
+  },
+  "debug_templates.py": {
+    "sha256": "355f7d6f2225e9974660de66c27f242e8dc260ad83cf0465f91192f60c784130",
+    "size": 1252
+  },
+  "delete_bot_msgs.bat": {
+    "sha256": "b7879df7e60387af43e7daf94c22f322d0b9643dc8ec00cc13838553af05804b",
+    "size": 60
+  },
+  "delete_bot_msgs.py": {
+    "sha256": "2a97fc52953831b1d433afcc9acb177b343851bad750e3525755f7b93449f728",
+    "size": 8519
+  },
+  "draw_corridors.py": {
+    "sha256": "7a0eeed7425e81063437e099064b2516fa7d3cc94818f1373fa33a2c71256364",
+    "size": 3748
+  },
+  "fileserver.py": {
+    "sha256": "c8959aef99b7d14c3a2b07715b33b1cd864fd50fadc592cfbfb790b65a83fbf2",
+    "size": 8602
+  },
+  "gamma_tuner.py": {
+    "sha256": "4d27e75401c041816f3d05266c132ec2799a8b267d031ac61e2bc4ee3515dca5",
+    "size": 2269
+  },
+  "git_init.bat": {
+    "sha256": "7d7756795ce568b25f00fffd53633cd204d710a6c12a38b2506183c2a74d52b3",
+    "size": 441
+  },
+  "git_push.bat": {
+    "sha256": "ccb0b99319ff9fae71d5601b80f4a16fc95d69518edcd18e46b6d9fbb493f191",
+    "size": 206
+  },
+  "hotkey_assist.py": {
+    "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
+    "size": 20400
+  },
+  "hp_monitor.py": {
+    "sha256": "301878d96ce229814f6f0052a62aa1dc222f130bbb4eadadd95144b1ff4f7b84",
+    "size": 8801
+  },
+  "input_recorder.py": {
+    "sha256": "740080848346d2466f14676a061f2f20ccbd12146826ad211c1e784872845188",
+    "size": 11663
+  },
+  "l2cursor.cur": {
+    "sha256": "54cb10aff82f637f159577a3c37c5e658dc1f4d03ca441f9ef12a2d726810735",
+    "size": 2238
+  },
+  "logger.py": {
+    "sha256": "49dbc0a9e4be51a45a9c5d815ead22cbc46439400bf04e607f6b769933473f8c",
+    "size": 4576
+  },
+  "make_manifest.bat": {
+    "sha256": "ed9bfc75cacabba73e1a64e5e7dc8e77e8e8bfb56f662981588d4b8ee696579f",
+    "size": 197
+  },
+  "minimap_align.bat": {
+    "sha256": "f2974afd3daa090e0809e24b48915ef1efe0e9af62ab388284529bfe41ccb818",
+    "size": 75
+  },
+  "minimap_orient.bat": {
+    "sha256": "59904ed13cd491f2ff6788134a923a1e58e8eb1d9c551c64263455e36df661ef",
+    "size": 71
+  },
+  "minimap_orient.py": {
+    "sha256": "0bcefb779fa836b8a3e681e51df52e09ac6a148094264df6dfe8d4c4e2372634",
+    "size": 16112
+  },
+  "minimap_refs/arrow_12.png": {
+    "sha256": "36d5490b63b05f318ec2f633c02ed0523ba1ae9e7ff8dc6c2f70feb684bb1044",
+    "size": 802
+  },
+  "minimap_refs/arrow_3.png": {
+    "sha256": "4f7bc28a1eb15fe6a8d2782bfa29fa2698b42b93ac8b950e5275a6a0177dd159",
+    "size": 791
+  },
+  "minimap_refs/arrow_6.png": {
+    "sha256": "f7e1832fa1b37e1bb423981b7a0ac5f10c129cbb2281945122850d7ff5cc30d3",
+    "size": 788
+  },
+  "minimap_refs/arrow_9.png": {
+    "sha256": "f293ba9150d291e75d846e6b0e62dc8a42f5f2bcda75d000e6c3a8d064fd3e6c",
+    "size": 794
+  },
+  "mouse.ino": {
+    "sha256": "fcce6b917ffa8b9e2d7953d870456c839803dba324353c4da708c8e95b0fdc04",
+    "size": 16635
+  },
+  "notifier.py": {
+    "sha256": "ace95de2e7fa0392585a618a70e71d1876b72278ff9a72b26f47105a8798a816",
+    "size": 5777
+  },
+  "probe_sender.py": {
+    "sha256": "b9f6188304798983480166eb5011269c0e432810183a60b7dfec34f7c45efef8",
+    "size": 2952
+  },
+  "README.txt": {
+    "sha256": "e2e10e7890d2dfbe0c6c48f317569f054a2cda593036f6d7949d8e0cb314af6e",
+    "size": 98
+  },
+  "rmb_anchor_timer.py": {
+    "sha256": "6161c62b2ea14772b7ee2c59e82b680d01dfdbc3bc9b357d7f0827ea65392b5f",
+    "size": 12247
+  },
+  "run_bot.bat": {
+    "sha256": "b962e4aac3ce9e4a95a5a9fb1bad8018be3ea303f775b3b24a1753c6b7432033",
+    "size": 329
+  },
+  "run_hotkey_assist.bat": {
+    "sha256": "14fa74507498b2a79d2ab5ee13f59bd2fd133b88b98573e994e0a581a5225d77",
+    "size": 378
+  },
+  "run_hp_monitor.bat": {
+    "sha256": "d17aa713cf75264cfd031f8514962d3eb159bb0ab695c237bdbed15312f4b298",
+    "size": 374
+  },
+  "run_recorder.bat": {
+    "sha256": "c58720720f5761455974eff644cd04f6dfd484cd86e668eafbf0e9e17992c827",
+    "size": 59
+  },
+  "run_rmb_timer.bat": {
+    "sha256": "214f072590476b0b459fd758a53645f1d16d4d13817af57a556e7e4dcbb74778",
+    "size": 175
+  },
+  "run_stream_sender.bat": {
+    "sha256": "1d043011e19f7ba509b89ab55023130ad824ae87ba47f019cde7aff4cf86cd03",
+    "size": 1722
+  },
+  "run_stream_sender_with_bot.bat": {
+    "sha256": "fa90ea8df3721427d6038f1991370de2489027805b24583a158d359fe666e1e2",
+    "size": 736
+  },
+  "run_stream_viewer.bat": {
+    "sha256": "85d036637abf4cabe5eac183806aae7db298abe18800c941e0fcc304c1e0878b",
+    "size": 285
+  },
+  "run_updater.bat": {
+    "sha256": "238a651d852a99d408a4754c50c00eb7401523676ff9b1fdfdf5cf9acb20a319",
+    "size": 414
+  },
+  "setup_slave_firewall.bat": {
+    "sha256": "9811c7fe2f17e0ba78a371c9dbddb900a71e0f4ebb223fd73264ff490dc30936",
+    "size": 828
+  },
+  "setup_slave_firewall.ps1": {
+    "sha256": "781aedf9824db2c2cb0376943c3e69f3a8f55aebc6080e280d3ecebbf8f29366",
+    "size": 2235
+  },
+  "start_fileserver.bat": {
+    "sha256": "928f65c16515a0a9ad65593cab41339a5ce2da072554895e0337e3046ac84b2c",
+    "size": 929
+  },
+  "stream_proto.py": {
+    "sha256": "cffa43e90774aa7864926f8ca6f3e6724287de2d7b51ebb8f479337e90a56f42",
+    "size": 8230
+  },
+  "stream_sender.py": {
+    "sha256": "c1225e4d523d14f5e5278f0c385b0628923544021650058e04a79a8c08fb434b",
+    "size": 47276
+  },
+  "stream_viewer.py": {
+    "sha256": "2603011c804567cd2d4b22a435ac7be3a2115556628bf42f45d5a0bd60580755",
+    "size": 64882
+  },
+  "Untitled": {
+    "sha256": "0cd66359ace0a40e10df1403c760a295c164b95d48fcc78bdd9633e429c31b28",
+    "size": 22
+  },
+  "updater.py": {
+    "sha256": "e61245a2c5e9e1ca2d60ffbef620b273e2243d892b7df0a5880567c969356e03",
+    "size": 18356
+  },
+  "vision.py": {
+    "sha256": "0f76aa6a3688babca22319086000235dd036a6f1c7b13fa54781d667b8843df5",
+    "size": 5539
+  },
+  "window_manager.py": {
+    "sha256": "f87f7449020e510132013f056a5c78c20e4e43c5c69f72c80123bab605b06429",
+    "size": 10555
+  },
   "config.py": {
-    "sha256": "97f29c389e2ba16bf764e47f717f3d6cbf2d24e322b9687dca060c3f55f63ee7",
-    "shared_sha256": "82f88730eaafa541544ea926a8972765dce953c826a9de49e4ca387a47ed4bf8",
-    "size": 19817,
+    "sha256": "13ecb8f6abfc988ca5320deec061f0232b8f911cbf58efc8ff1cb40d70232eb0",
+    "shared_sha256": "2a3b181a5a7652bba4dc74646baf7dd109a907c7aac1fcb08ba0d542f332697f",
+    "size": 22626,
     "partial_update": true
   }
 }

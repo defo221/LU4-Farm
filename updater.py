@@ -46,62 +46,22 @@ except Exception:
 # Everything AFTER this line (inclusive of the line itself) is auto-updatable.
 CONFIG_SHARED_MARKER = "# ─── SHARED SETTINGS"
 
-# Code / batch files that are identical on every machine.
-# config.py is deliberately excluded — it is machine-specific.
-TRACKED_CODE = [
-    "bot.py",
-    "hotkey_assist.py",
-    "arduino_hid.py",
-    "vision.py",
-    "window_manager.py",
-    "logger.py",
-    "notifier.py",
-    "capslock.py",
-    "hp_monitor.py",
-    "input_recorder.py",
-    "rmb_anchor_timer.py",
-    "debug_templates.py",
-    "run_bot.bat",
-    "run_hotkey_assist.bat",
-    "run_hp_monitor.bat",
-    "run_recorder.bat",
-    "run_rmb_timer.bat",
-    "updater.py",
-    "make_manifest.bat",
-    "run_updater.bat",
-    "start_fileserver.bat",
-    "fileserver.py",
-    # Remote-control fleet viewer. The sender and the protocol are needed on
-    # every slave; the viewer is only used on the main PC but is tracked anyway
-    # so any machine can drive the fleet. stream_slaves.json is deliberately
-    # excluded — it holds this LAN's host list, like config.py holds machine
-    # settings. mouse.ino is tracked so the firmware source stays in sync, but
-    # copying it does NOT flash a board; that is still done by hand per Arduino.
-    "stream_proto.py",
-    "stream_sender.py",
-    "stream_viewer.py",
-    "minimap_orient.py",
-    # Capture benchmark: run it on a slave to confirm dxcam is installed and
-    # working there, and to see that machine's frame-rate ceiling.
-    "bench_capture.py",
-    "minimap_orient.bat",
-    "minimap_align.bat",
-    "run_stream_sender.bat",
-    "run_stream_sender_with_bot.bat",
-    "run_stream_viewer.bat",
-    "setup_slave_firewall.bat",
-    "setup_slave_firewall.ps1",
-    "mouse.ino",
-    "l2cursor.cur",
-]
+# Directories excluded from automatic tracking (all files inside are skipped).
+_EXCLUDE_DIRS: set[str] = {
+    "logs",           # per-machine log files
+    "PXM_RB",        # separate sub-project, not deployed to slaves
+    "__pycache__",
+    ".git",
+}
 
-# Asset files to skip when scanning assets/ (debug / reference images only
-# used for offset calculation — not needed on other machines).
-_ASSET_IGNORE = {
-    "debug_hp_region.png",
-    "asus_char_bars.png",
-    "asus_mob_bars.png",
-    "open_bag.png",          # legacy name, kept for reference only
+# Individual files excluded from automatic tracking.
+# config.py      — machine-specific header; shared section updated separately.
+# stream_slaves.json — per-LAN host list, like config.py.
+# manifest.json  — the manifest itself should not track itself.
+_EXCLUDE_FILES: set[str] = {
+    "config.py",
+    "stream_slaves.json",
+    MANIFEST_FILE,
 }
 
 
@@ -117,21 +77,23 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _scan_assets(root: Path) -> list[str]:
-    """Return relative paths (forward slashes) of all tracked asset images."""
+def _scan_all(root: Path) -> list[str]:
+    """Return relative paths (forward slashes) of every file under *root*
+    that should be tracked — everything except excluded directories and files.
+    """
     result = []
-    assets_dir = root / "assets"
-    if not assets_dir.is_dir():
-        return result
-    for p in sorted(assets_dir.rglob("*")):
+    for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
-        if p.suffix.lower() not in (".png", ".jpg", ".bmp"):
+        rel  = p.relative_to(root)
+        # Skip if any parent directory component is excluded.
+        if any(part in _EXCLUDE_DIRS for part in rel.parts[:-1]):
             continue
-        if p.name in _ASSET_IGNORE:
+        if p.name in _EXCLUDE_FILES:
             continue
-        rel = p.relative_to(root).as_posix()
-        result.append(rel)
+        if "test" in p.stem.lower():
+            continue
+        result.append(rel.as_posix())
     return result
 
 
@@ -184,7 +146,7 @@ def _shared_sha256(text: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cmd_make() -> None:
-    tracked = TRACKED_CODE + _scan_assets(LOCAL_ROOT)
+    tracked = _scan_all(LOCAL_ROOT)
     manifest: dict[str, dict] = {}
     missing: list[str] = []
 

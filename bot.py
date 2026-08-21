@@ -201,7 +201,7 @@ def _sa_corridor_point(sx: int, sy: int,
     ux, uy = dx / length, dy / length   # unit vector toward target
     perp_x, perp_y = -uy, ux            # perpendicular unit vector
 
-    cap = max_dist_px if max_dist_px > 0 else length * 0.85
+    cap = max_dist_px if max_dist_px > 0 else length * cfg.SA_CORRIDOR_MAX_RATIO
     lo  = max(0.0, min(float(min_dist_px), cap * 0.95))
     d   = random.uniform(lo, cap)
 
@@ -1437,20 +1437,14 @@ class FarmBot:
 
         Called once bag_mob_anchor is confirmed on *frame*.
 
-        Flow:
-          1. Press attack immediately (start auto-attack / engage).
-          2. Find in_target_blue; rotate camera if not visible.
-          3. If already close enough: press attack again and return.
-          4. Otherwise approach via double-clicks in corridor.
-          5. Press attack again once close / after all clicks.
+        Two modes controlled by SA_ATTACK_BEFORE_APPROACH:
+          True  — press ASSIST_ATTACK_COUNT immediately, then approach.
+          False — detect distance first; attack immediately only if already
+                  within SA_APPROACH_SKIP_PX, otherwise approach first and
+                  attack only once within SA_APPROACH_STOP_PX.
         """
         fh, fw = frame.shape[:2]
         sc_x, sc_y = fw // 2, fh // 2
-
-        # Step 1 — immediate attack press as soon as target is confirmed.
-        logger.info("[BOT] SA: mob confirmed — immediate attack press")
-        self._press_attack()
-        capslock.raise_if_on()
 
         def _dot_center_from(f: np.ndarray) -> Optional[Tuple[int, int]]:
             """Detect in_target_blue OR in_target_red — both treated equally."""
@@ -1465,7 +1459,23 @@ class FarmBot:
                 dots = _sa_nms(dots, cfg.NC_NMS_DIST)
             return _sa_blue_pair_center(dots)
 
-        frame = self._grab()   # fresh frame after the attack press
+        # Step 1 — optional immediate attack depending on mode.
+        if cfg.SA_ATTACK_BEFORE_APPROACH:
+            if random.random() < cfg.SA_PRE_ATTACK_LONG_CHANCE:
+                pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_LONG_MIN,
+                                           cfg.SA_PRE_ATTACK_DELAY_LONG_MAX)
+                logger.info(f"[BOT] SA: pre-attack long delay {pre_delay:.2f}s (10% roll)")
+            else:
+                pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_MIN,
+                                           cfg.SA_PRE_ATTACK_DELAY_MAX)
+                logger.info(f"[BOT] SA: pre-attack delay {pre_delay:.2f}s")
+            capslock.interruptible_sleep(pre_delay)
+            capslock.raise_if_on()
+            logger.info("[BOT] SA: mob confirmed — immediate attack press")
+            self._press_attack()
+            capslock.raise_if_on()
+
+        frame = self._grab()
         pair_center = _dot_center_from(frame)
 
         if pair_center is None:
@@ -1482,54 +1492,74 @@ class FarmBot:
         dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
         logger.info(f"[BOT] SA: in_target_blue/red at {pair_center}, dist={dist:.0f}px")
 
-        if dist < cfg.SA_APPROACH_PX:
-            logger.info("[BOT] SA: close enough — attacking")
+        if dist < cfg.SA_APPROACH_SKIP_PX:
+            logger.info(f"[BOT] SA: already within SA_APPROACH_SKIP_PX"
+                        f" ({dist:.0f}px) — skipping ground clicks, attacking")
             self._press_attack()
             return True
 
         # Approach via double-clicks in corridor.
-        # Each iteration: fresh grab → check mob still present → recalculate → click → wait.
-        pt = self._active.assist_point
-        dclk_delays_max = [
-            cfg.SA_DCLK_DELAY_1_MAX,
-            cfg.SA_DCLK_DELAY_2_MAX,
-            cfg.SA_DCLK_DELAY_3_MAX,
-        ]
-        for dclk_i in range(cfg.SA_APPROACH_MAX_DCLK):
+        # Timing is distance-driven: after each double-click the bot polls every
+        # SA_APPROACH_POLL_MS ms and fires the next click once:
+        #   d_now  ≤  d_remaining + SA_NEXT_CLICK_LEAD_PX
+        # where d_remaining = pixel distance from the click point to the mob's
+        # dot centre at the moment of clicking, and d_now = current distance
+        # from screen centre to the mob's dot centre.
+        pt     = self._active.assist_point
+        poll_s = cfg.SA_APPROACH_POLL_MS / 1000.0
+        reached = False   # set True when dist < SA_APPROACH_STOP_PX
+
+        # Choose the click budget randomly upfront so different mobs get a
+        # different number of movement clicks (1–SA_APPROACH_MAX_DCLK).
+        n_clicks = random.randint(cfg.SA_APPROACH_MIN_DCLK,
+                                  cfg.SA_APPROACH_MAX_DCLK)
+        logger.info(f"[BOT] SA: approach budget = {n_clicks} double-click(s)")
+
+        for dclk_i in range(n_clicks):
             capslock.raise_if_on()
 
-            # Fresh grab before every click — use the latest mob position.
-            frame = self._grab()
+            if dclk_i == 0:
+                # Click #1: reuse the pair_center already computed above — the mob
+                # hasn't moved and re-grabbing + re-running three matchTemplate calls
+                # only adds 50–150 ms of unnecessary latency before the first click.
+                # bag_mob_anchor was confirmed by the caller, so no extra check here.
+                pass
+            else:
+                # Clicks #2+: character is now moving; grab a fresh frame.
+                frame = self._grab()
 
-            # If bag_mob_anchor vanished mid-approach: reacquire via RMB and
-            # stop all further ground-clicks for this mob.
-            self._mob_anchor.invalidate()
-            if self._mob_anchor.find(frame) is None:
-                logger.info(f"[BOT] SA: bag_mob_anchor lost at approach click"
-                            f" #{dclk_i + 1} — RMB reacquire + attack, no more clicks")
-                if pt is not None:
-                    self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
-                    capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
-                else:
-                    logger.warn("[BOT] SA: assist_point not set — skipping RMB reacquire")
-                self._press_attack()
-                return True
+                # Mob vanished mid-approach: RMB reacquire + attack, stop clicking.
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is None:
+                    logger.info(f"[BOT] SA: bag_mob_anchor lost at approach click"
+                                f" #{dclk_i + 1} — RMB reacquire + attack, no more clicks")
+                    if pt is not None:
+                        self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+                        capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                    else:
+                        logger.warn("[BOT] SA: assist_point not set — skipping RMB reacquire")
+                    self._press_attack()
+                    return True
 
-            pair_center = _dot_center_from(frame)
-            if pair_center is None:
-                logger.info("[BOT] SA: in_target_blue/red lost before approach"
-                            f" click #{dclk_i + 1} — attacking")
-                break
+                pair_center = _dot_center_from(frame)
+                if pair_center is None:
+                    logger.info("[BOT] SA: in_target_blue/red lost before approach"
+                                f" click #{dclk_i + 1} — attacking")
+                    break
+
             dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
-            if dist < cfg.SA_APPROACH_PX:
-                logger.info(f"[BOT] SA: close enough before click #{dclk_i + 1}"
-                            f" (dist={dist:.0f}px) — attacking")
+            if dist < cfg.SA_APPROACH_STOP_PX:
+                logger.info(f"[BOT] SA: within SA_APPROACH_STOP_PX before click"
+                            f" #{dclk_i + 1} (dist={dist:.0f}px) — attacking")
+                reached = True
                 break
 
-            delay_max_ms = (dclk_delays_max[dclk_i]
-                            if dclk_i < len(dclk_delays_max)
-                            else dclk_delays_max[-1])
-            min_dist = int(delay_max_ms * cfg.SA_CHAR_SPEED_PX_PER_MS)
+            # Minimum distance: first click ≥ SA_FIRST_CLICK_MIN_PX from screen
+            # centre; subsequent clicks ≥ SA_NEXT_CLICK_MIN_PX.  This prevents
+            # placing a click so close that the character arrives before the
+            # next poll cycle fires.
+            min_dist = (cfg.SA_FIRST_CLICK_MIN_PX if dclk_i == 0
+                        else cfg.SA_NEXT_CLICK_MIN_PX)
 
             # Perspective correction: shift the corridor target downward by an
             # amount proportional to how far the mob is from the 12/6 o'clock
@@ -1539,53 +1569,120 @@ class FarmBot:
             raw_len  = math.hypot(raw_dx, raw_dy) or 1.0
             h_factor = abs(raw_dx) / raw_len
             down_px  = int(h_factor * cfg.SA_APPROACH_DOWN_OFFSET_MAX)
-            eff_ty   = pair_center[1] + down_px   # shifted target Y
+            eff_ty   = pair_center[1] + down_px
 
             click_pt = _sa_corridor_point(sc_x, sc_y,
                                           pair_center[0], eff_ty,
                                           cfg.SA_CORRIDOR_W // 2,
                                           min_dist_px=min_dist)
+
+            # d_remaining: distance from click point to mob dot centre at the
+            # moment of clicking.  The poll loop fires the next click once
+            # d_now ≤ d_remaining + LEAD_PX (character nearly at click dest).
+            d_remaining = math.hypot(click_pt[0] - pair_center[0],
+                                     click_pt[1] - pair_center[1])
+
             logger.info(f"[BOT] SA: approach double-click #{dclk_i + 1}"
                         f" at {click_pt}, dist={dist:.0f}px,"
-                        f" h_factor={h_factor:.2f}, down_offset={down_px}px")
+                        f" d_remaining={d_remaining:.0f}px,"
+                        f" h_factor={h_factor:.2f}, down={down_px}px")
             self.hid.double_click_at(click_pt[0], click_pt[1])
 
-            # Delay split into SA_APPROACH_POLL_MS chunks.
-            # Each chunk: re-check bag_mob_anchor and distance so the bot
-            # exits immediately if the mob vanishes or the character arrives.
-            if delay_max_ms > 0:
-                total_s   = random.uniform(0, delay_max_ms / 1000.0)
-                elapsed_s = 0.0
-                poll_s    = cfg.SA_APPROACH_POLL_MS / 1000.0
-                while elapsed_s < total_s:
-                    chunk_s = min(poll_s, total_s - elapsed_s)
-                    capslock.interruptible_sleep(chunk_s)
-                    elapsed_s += chunk_s
+            # Poll until the character arrives or mob vanishes.
+            # Safety cap: random 5–8 s to avoid infinite loops.
+            # Use a wall-clock deadline so grab/matchTemplate overhead
+            # does not silently extend the wait beyond the cap.
+            max_wait_ms  = random.randint(cfg.SA_APPROACH_MAX_WAIT_MIN_MS,
+                                          cfg.SA_APPROACH_MAX_WAIT_MAX_MS)
+            click_deadline = time.perf_counter() + max_wait_ms / 1000.0
+            while time.perf_counter() < click_deadline:
+                capslock.interruptible_sleep(poll_s)
+                capslock.raise_if_on()
 
+                frame = self._grab()
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is None:
+                    logger.info(f"[BOT] SA: bag_mob_anchor lost during approach"
+                                f" after click #{dclk_i + 1}"
+                                " — RMB reacquire + attack, no more clicks")
+                    if pt is not None:
+                        self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+                        capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                    else:
+                        logger.warn("[BOT] SA: assist_point not set"
+                                    " — skipping RMB reacquire")
+                    self._press_attack()
+                    return True
+
+                pc = _dot_center_from(frame)
+                if pc is not None:
+                    d_now = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
+                    if d_now < cfg.SA_APPROACH_STOP_PX:
+                        logger.info(f"[BOT] SA: within SA_APPROACH_STOP_PX during"
+                                    f" approach after click #{dclk_i + 1}"
+                                    f" (dist={d_now:.0f}px)")
+                        reached = True
+                        break
+                    if d_now <= d_remaining + cfg.SA_NEXT_CLICK_LEAD_PX:
+                        logger.info(f"[BOT] SA: next-click trigger after"
+                                    f" #{dclk_i + 1} (d_now={d_now:.0f}"
+                                    f" ≤ d_rem={d_remaining:.0f}"
+                                    f" + lead={cfg.SA_NEXT_CLICK_LEAD_PX})")
+                        break
+            else:
+                logger.info(f"[BOT] SA: max wait ({max_wait_ms} ms)"
+                            f" reached after click #{dclk_i + 1} — proceeding")
+
+            if reached:
+                break
+
+        # ---- Final fallback if SA_APPROACH_PX not yet reached ---------------
+        if not reached:
+            frame       = self._grab()
+            pc_final    = _dot_center_from(frame)
+            if pc_final is not None:
+                half  = cfg.SA_APPROACH_FINAL_AREA // 2
+                ex_hw = cfg.SA_APPROACH_FINAL_EXCL_W // 2
+                px, py = pc_final
+                # Click area: SA_APPROACH_FINAL_AREA × SA_APPROACH_FINAL_AREA
+                # box whose top edge is at the dot centre (i.e. fully below it).
+                # Exclusion: SA_APPROACH_FINAL_EXCL_W × SA_APPROACH_FINAL_EXCL_H
+                # strip at the top of the area, directly around the dot centre.
+                for _ in range(60):
+                    fx = random.randint(px - half, px + half)
+                    fy = random.randint(py, py + cfg.SA_APPROACH_FINAL_AREA)
+                    if (abs(fx - px) <= ex_hw
+                            and fy <= py + cfg.SA_APPROACH_FINAL_EXCL_H):
+                        continue
+                    break
+                else:
+                    fx, fy = px, py + half   # safe fallback point
+                logger.info(f"[BOT] SA: final fallback double-click at ({fx},{fy})")
+                self.hid.double_click_at(fx, fy)
+
+                # Wait SA_APPROACH_FINAL_WAIT_MIN/MAX_MS, polling for SA_APPROACH_STOP_PX.
+                # Wall-clock deadline prevents grab/matchTemplate overhead from
+                # silently multiplying the actual wait duration.
+                wait_s         = random.uniform(
+                    cfg.SA_APPROACH_FINAL_WAIT_MIN_MS / 1000.0,
+                    cfg.SA_APPROACH_FINAL_WAIT_MAX_MS / 1000.0)
+                final_deadline = time.perf_counter() + wait_s
+                while time.perf_counter() < final_deadline:
+                    capslock.interruptible_sleep(poll_s)
+                    capslock.raise_if_on()
                     frame = self._grab()
-                    self._mob_anchor.invalidate()
-                    if self._mob_anchor.find(frame) is None:
-                        logger.info(f"[BOT] SA: bag_mob_anchor lost during delay"
-                                    f" after click #{dclk_i + 1}"
-                                    " — RMB reacquire + attack, no more clicks")
-                        if pt is not None:
-                            self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
-                            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
-                        else:
-                            logger.warn("[BOT] SA: assist_point not set"
-                                        " — skipping RMB reacquire")
-                        self._press_attack()
-                        return True
-
                     pc = _dot_center_from(frame)
                     if pc is not None:
                         d = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
-                        if d < cfg.SA_APPROACH_PX:
-                            logger.info(f"[BOT] SA: reached SA_APPROACH_PX during"
-                                        f" delay after click #{dclk_i + 1}"
-                                        f" (dist={d:.0f}px) — attacking immediately")
-                            self._press_attack()
-                            return True
+                        if d < cfg.SA_APPROACH_STOP_PX:
+                            logger.info(f"[BOT] SA: within SA_APPROACH_STOP_PX"
+                                        f" during final wait (dist={d:.0f}px)")
+                            break
+                else:
+                    logger.info("[BOT] SA: final wait elapsed without reaching"
+                                " SA_APPROACH_STOP_PX — attacking anyway")
+            else:
+                logger.info("[BOT] SA: dots lost before final fallback click")
 
         self._press_attack()
         return True
@@ -1725,7 +1822,7 @@ class FarmBot:
                     """Attack + full kill cycle for one mob in the F5 chain.
 
                     Mirrors _cycle()'s flow: phase4 → _wait_low_hp → F2 →
-                    _wait_mob_dead.  Returns False if a timeout breaks the chain
+                    _wait_death.  Returns False if a timeout breaks the chain
                     so the caller can exit the sub-loop early.
                     """
                     self._sa_phase4(frame)
@@ -1741,7 +1838,7 @@ class FarmBot:
                     # "ok" or "stalled" — press finisher and wait for death
                     _press(self.hid, "f2")
                     logger.info(f"[BOT] F2 in '{self._active.title}'")
-                    self._wait_mob_dead()
+                    self._wait_death()
                     return True
 
                 if not _do_kill_cycle("kill #1"):
@@ -1854,15 +1951,25 @@ class FarmBot:
                     if self._healer_anchor is not None else None)
 
         def _healer_bounds(hp: Tuple[int, int], f: np.ndarray):
-            h = cfg.SA_HEALER_CLICK_AREA // 2
-            fh_ = f.shape[0]
-            above = hp[1] < fh_ // 2
-            xn = hp[0] - h
-            xx = hp[0] + h
-            yn = hp[1] - (cfg.SA_HEALER_UPPER_EXTEND if above else h)
-            yx = hp[1] + (h if above else cfg.SA_HEALER_LOWER_EXTEND)
-            ehw = cfg.SA_HEALER_EXCL_W // 2
-            ebot = hp[1] + cfg.SA_HEALER_EXCL_H
+            h   = cfg.SA_HEALER_CLICK_AREA
+            hh  = h // 2
+            above = hp[1] < f.shape[0] // 2
+            xn = hp[0] - hh
+            xx = hp[0] + hh
+            if above:
+                # Anchor in upper half → click area entirely below the anchor.
+                # Exclusion zone blocks the strip directly beneath the icon.
+                yn   = hp[1]
+                yx   = hp[1] + h
+                ehw  = cfg.SA_HEALER_EXCL_W // 2
+                ebot = hp[1] + cfg.SA_HEALER_EXCL_H
+            else:
+                # Anchor in lower half → click area entirely above the anchor.
+                # No exclusion zone needed (clicks never overlap the icon).
+                yn   = hp[1] - h
+                yx   = hp[1]
+                ehw  = 0
+                ebot = hp[1]
             return xn, xx, yn, yx, ehw, ebot
 
         def _pick_healer_pt(xn, xx, yn, yx, ehw, ebot, hp,
@@ -2001,11 +2108,10 @@ class FarmBot:
 
         if not self._sa_recovery_mode:
             # ---- Phase 1: SA_RMB_ATTEMPTS RMB clicks ---------------------------
-            # If mob_dead is still visible after an RMB click the bot latched
-            # onto the stale dead-mob target bar.  Keep clicking until the
-            # death indicator clears before counting real Phase-1 attempts.
-            real_rmb = 0
-            while real_rmb < cfg.SA_RMB_ATTEMPTS:
+            # mob_dead visible after an RMB is not treated as a stale-target
+            # condition any more; the attempt is always counted so the phase
+            # advances at a predictable pace.
+            for rmb_i in range(1, cfg.SA_RMB_ATTEMPTS + 1):
                 capslock.raise_if_on()
                 if pt is not None:
                     self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
@@ -2013,24 +2119,17 @@ class FarmBot:
                     logger.warn("[BOT] SA: assist_point not set — skipping RMB")
                 capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
                 frame = self._grab()
-
-                # Stale-target guard: if the death overlay is still on screen
-                # the previous mob hasn't been cleared yet — repeat without
-                # consuming a Phase-1 slot.
-                self._mob_dead_f.invalidate()
-                if self._mob_dead_f.find(frame, silent=True) is not None:
-                    logger.info(
-                        "[BOT] SA phase-1: mob_dead still visible"
-                        " — stale target, repeating RMB (not counted)")
-                    continue  # real_rmb unchanged
-
-                real_rmb += 1
                 logger.info(
-                    f"[BOT] SA phase-1 RMB #{real_rmb}/{cfg.SA_RMB_ATTEMPTS}")
+                    f"[BOT] SA phase-1 RMB #{rmb_i}/{cfg.SA_RMB_ATTEMPTS}")
                 self._mob_anchor.invalidate()
                 if self._mob_anchor.find(frame) is not None:
-                    logger.info("[BOT] SA: bag_mob_anchor found after RMB")
-                    return self._sa_phase4(frame)
+                    self._mob_dead_f.invalidate()
+                    if self._mob_dead_f.find(frame, silent=True) is not None:
+                        logger.info("[BOT] SA phase-1: bag_mob_anchor + mob_dead"
+                                    " — dead target, not counting as live")
+                    else:
+                        logger.info("[BOT] SA: bag_mob_anchor found after RMB")
+                        return self._sa_phase4(frame)
 
             # ---- Phase 2: SA_F5_ATTEMPTS F5 presses ----------------------------
             for i in range(cfg.SA_F5_ATTEMPTS):
@@ -2041,8 +2140,13 @@ class FarmBot:
                 frame = self._grab()
                 self._mob_anchor.invalidate()
                 if self._mob_anchor.find(frame) is not None:
-                    logger.info("[BOT] SA: bag_mob_anchor found after F5")
-                    return self._sa_phase4(frame)
+                    self._mob_dead_f.invalidate()
+                    if self._mob_dead_f.find(frame, silent=True) is not None:
+                        logger.info("[BOT] SA phase-2: bag_mob_anchor + mob_dead"
+                                    " — dead target, not counting as live")
+                    else:
+                        logger.info("[BOT] SA: bag_mob_anchor found after F5")
+                        return self._sa_phase4(frame)
 
             # All normal attempts exhausted → enter recovery
             logger.info("[BOT] SA: entering recovery mode")

@@ -84,7 +84,6 @@ PACE_FRACTION = 0.8            # of the frame interval
 PACE_MAX_S = 0.05              # hard cap, so idle tiles stay responsive
 
 REMOTE_STEP_SIZE = 40          # px per HID report; 10 is far too slow for panning
-MOVE_SETTLE_TIMEOUT = 0.40     # s to wait for the cursor to reach the target
 MOVE_TOLERANCE = 2             # px; closer than this counts as arrived
 MOVE_CORRECTIONS = 3           # extra MOVE passes allowed to close the gap
 
@@ -301,10 +300,12 @@ class HidLink:
         """Aim the cursor at absolute (x, y).
 
         The Arduino can only move relatively, so we read the current position,
-        send the delta, then verify.  Verification matters here: pointer
-        acceleration, screen-edge clamping and rounding all make a single
-        blind delta land in the wrong place, and a remote click that misses by
-        20 px is worse than a slow one.
+        send the delta, and wait for the firmware's "OK" reply before checking
+        again.  The reply-wait is critical: at 9600 baud a "MOVE,-500,-300\n"
+        command takes ~15 ms just to reach the Arduino.  The old fire-and-forget
+        path called cursor_pos() before the first HID report was even sent,
+        detected "no movement yet" and immediately issued a second MOVE – so
+        the cursor ended up moving 2-4× the intended distance.
         """
         if self._ser is None:
             return False
@@ -313,41 +314,21 @@ class HidLink:
             dx, dy = int(x) - cx, int(y) - cy
             if abs(dx) <= MOVE_TOLERANCE and abs(dy) <= MOVE_TOLERANCE:
                 return True
-            self._tell(f"MOVE,{dx},{dy}")
-            self._await_settle(x, y, max(abs(dx), abs(dy)))
+            self._ask(f"MOVE,{dx},{dy}")   # blocks until firmware replies "OK"
         cx, cy = cursor_pos()
         if abs(int(x) - cx) > MOVE_TOLERANCE or abs(int(y) - cy) > MOVE_TOLERANCE:
             logger.warn(f"[HID] aim missed: wanted ({x},{y}) got ({cx},{cy})")
         return True
 
-    def _await_settle(self, x, y, distance):
-        """Poll the cursor until it reaches the target or stops moving."""
-        # Each step is one ~1 ms USB frame plus the firmware's 200 us pause.
-        expected = (distance / max(REMOTE_STEP_SIZE, 1)) * 0.0013 + 0.008
-        deadline = time.perf_counter() + min(expected * 3 + 0.05, MOVE_SETTLE_TIMEOUT)
-        last = None
-        still = 0
-        while time.perf_counter() < deadline:
-            pos = cursor_pos()
-            if abs(pos[0] - int(x)) <= MOVE_TOLERANCE and \
-               abs(pos[1] - int(y)) <= MOVE_TOLERANCE:
-                return
-            if pos == last:
-                still += 1
-                if still >= 3:                    # cursor parked: clamped or done
-                    return
-            else:
-                still = 0
-                last = pos
-            time.sleep(0.002)
-
     def move_rel(self, dx, dy):
         if dx == 0 and dy == 0:
             return True
-        ok = self._tell(f"MOVE,{int(dx)},{int(dy)}")
-        steps = max(abs(int(dx)), abs(int(dy))) / max(REMOTE_STEP_SIZE, 1)
-        time.sleep(steps * 0.0013 + 0.004)
-        return ok
+        return self._ask(f"MOVE,{int(dx)},{int(dy)}") != ""
+
+    def hover(self, x, y, duration_ms=800):
+        """Move to (x, y) and rest there so the game can show a tooltip."""
+        self.move_abs(x, y)
+        time.sleep(duration_ms / 1000.0)
 
     # ---- buttons ----
     def click(self, btn="left", hold_min=25, hold_max=55):
@@ -857,6 +838,8 @@ class Session:
                 self.hid.button_up(btn)
         elif t == "move":
             self.hid.move_abs(cmd["x"], cmd["y"])
+        elif t == "hover":
+            self.hid.hover(cmd["x"], cmd["y"], cmd.get("ms", 800))
         elif t == "moverel":
             self.hid.move_rel(cmd.get("dx", 0), cmd.get("dy", 0))
         elif t == "drag":

@@ -114,6 +114,7 @@ ACTIVE_FPS = 20.0              # the selected tile; +/- retunes this live
 FPS_LIMITS = (1.0, 30.0)
 UI_HZ = 30                     # redraw rate
 PAN_SEND_HZ = 25               # cap on moverel messages while right-dragging
+HOVER_SEND_HZ = 20             # cap on move messages while hovering (no button)
 RECONNECT_DELAY = 3.0
 PING_EVERY = 2.0               # keeps the slave's watchdog quiet
 JPEG_QUALITY_IDLE = 55
@@ -143,6 +144,27 @@ KEYSYM_MAP = {
 KEYSYM_MAP.update({f"F{i}": f"f{i}" for i in range(1, 13)})
 
 
+# Windows VK codes for the ten standard OEM punctuation keys → QWERTY ASCII.
+# Used when the active keyboard layout produces a non-ASCII character (e.g.
+# Cyrillic) for one of these physical keys.  Sending the QWERTY equivalent
+# lets the slave's game produce the right character via its own layout.
+#
+# Russian ЙЦУКЕН example:  б→VK188→','   ю→VK190→'.'   ж→VK186→';'   etc.
+_OEM_VK_TO_QWERTY = {
+    186: ";",   # VK_OEM_1
+    187: "=",   # VK_OEM_PLUS
+    188: ",",   # VK_OEM_COMMA
+    189: "-",   # VK_OEM_MINUS
+    190: ".",   # VK_OEM_PERIOD
+    191: "/",   # VK_OEM_2
+    192: "`",   # VK_OEM_3
+    219: "[",   # VK_OEM_4
+    220: "\\",  # VK_OEM_5
+    221: "]",   # VK_OEM_6
+    222: "'",   # VK_OEM_7
+}
+
+
 def keysym_to_name(event):
     """Translate a Tk key event into a firmware key name, or None.
 
@@ -154,9 +176,9 @@ def keysym_to_name(event):
     VK_A=65..VK_Z=90 are always the 26 QWERTY letter positions.
     VK_0=48..VK_9=57 are always the ten digit positions on the main row.
 
-    Special keys (arrows, F1-F12, Tab, …) use the keysym table and are already
-    layout-independent in Tk.  Punctuation falls back to the character produced
-    by the layout, since OEM VK codes differ across keyboard hardware.
+    OEM punctuation keys are mapped by their QWERTY equivalent so that non-ASCII
+    layouts (Cyrillic, etc.) forward the physical key rather than the produced
+    glyph, which the Arduino firmware cannot encode.
     """
     ks = event.keysym
     if ks in KEYSYM_MAP:
@@ -166,12 +188,19 @@ def keysym_to_name(event):
         return chr(kc + 32)
     if 48 <= kc <= 57:                # VK_0..VK_9 → '0'..'9'
         return chr(kc)
-    # Punctuation fallback: use whatever the layout produces.
-    if len(ks) == 1 and ks.isprintable():
+    # ASCII punctuation: return the produced character directly — the firmware
+    # and Arduino Keyboard library handle all printable ASCII values.
+    if len(ks) == 1 and ks.isprintable() and ord(ks) < 128:
         return ks.lower()
     ch = event.char
-    if ch and len(ch) == 1 and ch.isprintable():
+    if ch and len(ch) == 1 and ch.isprintable() and ord(ch) < 128:
         return ch.lower()
+    # Non-ASCII character (Cyrillic, etc.): the produced glyph cannot be
+    # forwarded as-is.  Look up the physical OEM key by VK code and send its
+    # QWERTY equivalent so the slave's own keyboard layout produces the right
+    # character in the game.
+    if kc in _OEM_VK_TO_QWERTY:
+        return _OEM_VK_TO_QWERTY[kc]
     return None
 
 
@@ -403,8 +432,9 @@ class Viewer:
         self.active_fps = ACTIVE_FPS
 
         self._pan = None              # active right-drag state
-        self._lmb_down = None         # {"tile": idx, "last": (x, y)} while LMB held
+        self._lmb_down = None         # {"tile", "last", "pending", "sent_at"} while LMB held
         self._drag_src = None         # tile index where Ctrl+Alt drag started
+        self._hover_sent_at = 0.0     # perf_counter timestamp of last hover move sent
         self._layout_key = None
         self._alt_held = False        # Alt is down on the viewer keyboard
         self._alt_combo = False       # this Alt hold was used as Alt+digit
@@ -886,6 +916,19 @@ class Viewer:
             if idx is not None and idx != self.selected:
                 self._select(idx)
 
+        # Stream cursor position to the slave so hover/tooltip works.
+        # Only when no drag is active; throttled to HOVER_SEND_HZ.
+        if self._pan is None and self._lmb_down is None:
+            active_idx = self.hover_idx if self.zoomed else self.selected
+            if active_idx is not None and idx == active_idx:
+                now = time.perf_counter()
+                if now - self._hover_sent_at >= 1.0 / HOVER_SEND_HZ:
+                    t = self.tiles[active_idx]
+                    pos = t.canvas_to_slave(event.x, event.y)
+                    if pos is not None:
+                        t.link.send({"t": "move", "x": pos[0], "y": pos[1]})
+                        self._hover_sent_at = now
+
         if self._cur_id is None:
             return
         self.canvas.coords(self._cur_id,
@@ -975,7 +1018,8 @@ class Viewer:
             pos = t.canvas_to_slave(event.x, event.y)
             if pos is not None:
                 t.link.send({"t": "mdown", "x": pos[0], "y": pos[1], "btn": "left"})
-                self._lmb_down = {"tile": idx, "last": (event.x, event.y)}
+                self._lmb_down = {"tile": idx, "last": (event.x, event.y),
+                                  "pending": (0.0, 0.0), "sent_at": 0.0}
             return
         # Grid mode: first click focuses the tile; subsequent clicks act.
         if idx != self.selected:
@@ -986,10 +1030,17 @@ class Viewer:
         if pos is None:
             return
         t.link.send({"t": "mdown", "x": pos[0], "y": pos[1], "btn": "left"})
-        self._lmb_down = {"tile": idx, "last": (event.x, event.y)}
+        self._lmb_down = {"tile": idx, "last": (event.x, event.y),
+                          "pending": (0.0, 0.0), "sent_at": 0.0}
 
     def _on_left_motion(self, event):
-        """Send relative mouse movement while LMB is held (drag support)."""
+        """Send relative mouse movement while LMB is held (drag support).
+
+        Accumulates sub-pixel canvas deltas and flushes at most PAN_SEND_HZ
+        times per second.  Without this throttle, fast mouse movement generates
+        hundreds of moverel commands that pile up in the TCP buffer, causing the
+        slave to replay them long after the drag has ended.
+        """
         if self._lmb_down is None:
             return
         t = self.tiles[self._lmb_down["tile"]]
@@ -999,9 +1050,27 @@ class Viewer:
         dy_c = event.y - ly
         if dx_c == 0 and dy_c == 0:
             return
-        dx, dy = t.canvas_delta_to_slave(dx_c, dy_c)
-        if dx != 0 or dy != 0:
-            t.link.send({"t": "moverel", "dx": dx, "dy": dy})
+        px, py = self._lmb_down.get("pending", (0.0, 0.0))
+        self._lmb_down["pending"] = (px + dx_c, py + dy_c)
+
+        now = time.perf_counter()
+        if now - self._lmb_down.get("sent_at", 0.0) < 1.0 / PAN_SEND_HZ:
+            return
+        self._flush_lmb_drag(t)
+
+    def _flush_lmb_drag(self, t):
+        """Flush accumulated LMB-drag delta to the slave."""
+        if self._lmb_down is None or not t.shown:
+            return
+        px, py = self._lmb_down.get("pending", (0.0, 0.0))
+        dx, dy = t.canvas_delta_to_slave(px, py)
+        if dx == 0 and dy == 0:
+            return
+        (_, _, rw, _), _, _, dw, _ = t.shown
+        k = rw / dw if dw else 1.0
+        self._lmb_down["pending"] = (px - dx / k, py - dy / k)
+        self._lmb_down["sent_at"] = time.perf_counter()
+        t.link.send({"t": "moverel", "dx": dx, "dy": dy})
 
     def _on_left_up(self, event):
         """Release LMB on the slave, or complete a Ctrl+Alt drag-to-swap."""
@@ -1023,11 +1092,15 @@ class Viewer:
                 self._layout_key = None
             return
 
-        # Normal LMB release: send mup to the tile that received the mdown.
+        # Normal LMB release: flush any remaining drag delta, then send mup.
         held = self._lmb_down
         self._lmb_down = None
         if held is not None:
-            self.tiles[held["tile"]].link.send({"t": "mup", "btn": "left"})
+            t = self.tiles[held["tile"]]
+            self._lmb_down = held   # temporarily restore so _flush_lmb_drag can read it
+            self._flush_lmb_drag(t)
+            self._lmb_down = None
+            t.link.send({"t": "mup", "btn": "left"})
 
     def _on_middle_down(self, event):
         """Toggle per-tile max-FPS lock.  Never forwarded to the slave."""
