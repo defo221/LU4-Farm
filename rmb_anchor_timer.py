@@ -193,12 +193,25 @@ def _poll_thread() -> None:
 
     with mss.mss() as sct:
         mon = sct.monitors[1]
-        region = {
-            "left":   mon["left"],
-            "top":    mon["top"],
-            "width":  mon["width"],
-            "height": min(mon["height"], cfg.ANCHOR_TOP_REGION_PX),
-        }
+        _roi = (cfg.BAG_MOB_ANCHOR_ROI_FHD
+                if cfg.RESOLUTION == "FHD"
+                   and getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None) is not None
+                else None)
+        if _roi is not None:
+            rx1, ry1, rx2, ry2 = _roi
+            region = {
+                "left":   mon["left"] + rx1,
+                "top":    mon["top"]  + ry1,
+                "width":  rx2 - rx1,
+                "height": ry2 - ry1,
+            }
+        else:
+            region = {
+                "left":   mon["left"],
+                "top":    mon["top"],
+                "width":  mon["width"],
+                "height": min(mon["height"], cfg.ANCHOR_TOP_REGION_PX),
+            }
 
         idx = 0
 
@@ -297,7 +310,13 @@ def main() -> None:
 
     print("\nbag_mob_anchor latency timer")
     print(f"  Confidence  : {CONFIDENCE}")
-    print(f"  Search area : top {cfg.ANCHOR_TOP_REGION_PX} px of primary monitor")
+    _roi_desc = (
+        f"ROI {cfg.BAG_MOB_ANCHOR_ROI_FHD}"
+        if cfg.RESOLUTION == "FHD"
+           and getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None) is not None
+        else f"top {cfg.ANCHOR_TOP_REGION_PX} px"
+    )
+    print(f"  Search area : {_roi_desc} of primary monitor")
     print(f"  Poll every  : {POLL_MS} ms  |  Timeout : {TIMEOUT_S:.0f} s")
     print()
     print("  >> Press the KEY or MOUSE BUTTON you want to track <<")

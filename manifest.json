@@ -115,6 +115,18 @@
     "sha256": "43c7148f93e7736f2e2feda0b6e4202571f7319bb159bfef4eb164d0379c27e0",
     "size": 599
   },
+  "assets/fullhd/ma1.png": {
+    "sha256": "6655d12b563622aec055223f11b731500ed3e2e7ff22af30a317e4b6640226d3",
+    "size": 883
+  },
+  "assets/fullhd/ma2.png": {
+    "sha256": "d23b2d38a4ae737a57356fb610fc5831895f7bf7e7577fb809a505b55bf9336d",
+    "size": 999
+  },
+  "assets/fullhd/ma_anchor.png": {
+    "sha256": "720125375078ee9142ea5760b651463d0fabfd3e0d166f6d478a1e1691fc9a01",
+    "size": 525
+  },
   "assets/fullhd/mob_dead.png": {
     "sha256": "1acad251d7a946bb5dcc8709e7f2a898b8c364c351785642c4551984d66e5d56",
     "size": 4537
@@ -168,12 +180,16 @@
     "size": 7705
   },
   "bot.py": {
-    "sha256": "c66bc3eee7260b3e4e57dd71060c48eaff4632993a6bdb918620f4c1478c883e",
-    "size": 135326
+    "sha256": "c8e7648606b1eefcd8df688c8e9707fcc05001fe91498af6bedf78089d3fa88f",
+    "size": 193194
   },
   "capslock.py": {
     "sha256": "193fb40114fcd0f02df18456dc5d63002e415babca3aa38a44c6b32d759a8863",
     "size": 3901
+  },
+  "click_recorder.py": {
+    "sha256": "42ba650d068227321ba36fcbf41e6a3842681aaa5538ee7804a63f142ea63e34",
+    "size": 4669
   },
   "debug_templates.py": {
     "sha256": "355f7d6f2225e9974660de66c27f242e8dc260ad83cf0465f91192f60c784130",
@@ -208,8 +224,8 @@
     "size": 206
   },
   "hotkey_assist.py": {
-    "sha256": "efde61db160d8a3694658837881287186e05e6ea0edfbf0242801fa3a92544ce",
-    "size": 20400
+    "sha256": "65f5beabe6d43019ab31f791f4bbfefb74563478d07e407c8159d5d24b41eb39",
+    "size": 20635
   },
   "hp_monitor.py": {
     "sha256": "301878d96ce229814f6f0052a62aa1dc222f130bbb4eadadd95144b1ff4f7b84",
@@ -276,12 +292,16 @@
     "size": 98
   },
   "rmb_anchor_timer.py": {
-    "sha256": "6161c62b2ea14772b7ee2c59e82b680d01dfdbc3bc9b357d7f0827ea65392b5f",
-    "size": 12247
+    "sha256": "b3afce86c31b73b10c1f541632811c5a3c25f7cb47a9b63dabc0af1d008fb63c",
+    "size": 12968
   },
   "run_bot.bat": {
     "sha256": "b962e4aac3ce9e4a95a5a9fb1bad8018be3ea303f775b3b24a1753c6b7432033",
     "size": 329
+  },
+  "run_click_recorder.bat": {
+    "sha256": "739d349a036c545687250ef0eec121d870d46529aef308261cef6baf806b0c60",
+    "size": 62
   },
   "run_hotkey_assist.bat": {
     "sha256": "14fa74507498b2a79d2ab5ee13f59bd2fd133b88b98573e994e0a581a5225d77",
@@ -290,6 +310,10 @@
   "run_hp_monitor.bat": {
     "sha256": "d17aa713cf75264cfd031f8514962d3eb159bb0ab695c237bdbed15312f4b298",
     "size": 374
+  },
+  "run_ma_calibration.bat": {
+    "sha256": "405e35b76a97733e1c786e33a014f70a938fccb0c2c1a614666291f9e6eaee18",
+    "size": 64
   },
   "run_recorder.bat": {
     "sha256": "c58720720f5761455974eff644cd04f6dfd484cd86e668eafbf0e9e17992c827",
@@ -332,12 +356,12 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "c1225e4d523d14f5e5278f0c385b0628923544021650058e04a79a8c08fb434b",
-    "size": 47276
+    "sha256": "c648cac9f2f2994250d2c55ddadca0c865e474a34ac95e2acbc16e2444212192",
+    "size": 47521
   },
   "stream_viewer.py": {
-    "sha256": "2603011c804567cd2d4b22a435ac7be3a2115556628bf42f45d5a0bd60580755",
-    "size": 64882
+    "sha256": "058929f5c322751f0c7b1d0814c585ce460ea4519ff1be44f12dbb8b749bf9e8",
+    "size": 68514
   },
   "Untitled": {
     "sha256": "0cd66359ace0a40e10df1403c760a295c164b95d48fcc78bdd9633e429c31b28",
@@ -356,9 +380,9 @@
     "size": 10555
   },
   "config.py": {
-    "sha256": "13ecb8f6abfc988ca5320deec061f0232b8f911cbf58efc8ff1cb40d70232eb0",
-    "shared_sha256": "2a3b181a5a7652bba4dc74646baf7dd109a907c7aac1fcb08ba0d542f332697f",
-    "size": 22626,
+    "sha256": "e795f6f1a5eeee68bd5d245b4d294e9d823f760517084bd1a96c6fb3aec8eaa9",
+    "shared_sha256": "5b27429179ba97677aaefeb9ae902c2fc813ad2c809805e5c45b4cda5f52b003",
+    "size": 21955,
     "partial_update": true
   }
 }

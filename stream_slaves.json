@@ -7,7 +7,7 @@
     { "name": "14 Glide", "host": "192.168.0.184", "port": 8772 },
     { "name": "15 Jenit", "host": "192.168.0.182", "port": 8772 },
     { "name": "16 Dorin", "host": "192.168.0.119", "port": 8772 },
-    { "name": "11 Revoke", "host": "192.168.0.172", "port": 8772 },
+    { "name": "D01 Revoke", "host": "192.168.0.170", "port": 8772 },
     { "name": "D02 RNine", "host": "192.168.0.162", "port": 8772 },
     { "name": "PC8", "host": "192.168.0.18", "port": 8772 },
     { "name": "PC9", "host": "192.168.0.19", "port": 8772 }

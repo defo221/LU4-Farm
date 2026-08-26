@@ -425,8 +425,11 @@ def _hook_cb(nCode: int, wParam: int, lParam: int) -> int:
 
         entry = _TRIGGER_VK.get(vk)
         if entry is not None:
+            # Honour CapsLock as a global pause: when it is toggled on, pass
+            # the trigger through to the game unchanged (same semantics as bot.py).
+            caps_on = bool(_u32.GetKeyState(0x14) & 1)
             from_wk = _foreground_win_key()
-            if from_wk is not None and not _busy.is_set():
+            if not caps_on and from_wk is not None and not _busy.is_set():
                 # Idle — consume the user's trigger and start a sequence.
                 action_type, target_key = entry
                 try:

@@ -40,15 +40,15 @@ ARDUINO_BAUD = 9600
 # ---------------------------------------------------------------------------
 WINDOWS = {
     "win1": {
-        "title":       "Snitch",
+        "title":       "Anorien",
         "char_role":   "DD",
         "enabled":     True,
         "taskbar_pos": 1,               # Win+1 — first icon after the search bar
     },
     "win2": {
-        "title":       "Anorien",
+        "title":       "Qwinsa",
         "char_role":   "DD",
-        "enabled":     False,
+        "enabled":     True,
         "taskbar_pos": 2,               # Win+2
     },
 }
@@ -70,6 +70,7 @@ WIN_SETTLE_MS_MAX = 200        # ms to wait after each window switch (max)
 RESOLUTION = "QHD"
 
 # ─── SHARED SETTINGS — managed by updater.py, do not edit below this line ───
+# Sections: Core → Assist → NextTarget → Hotkey Assist
 
 _PROFILES = {
     "QHD": {
@@ -167,223 +168,230 @@ _PROFILES = {
 PROFILE = _PROFILES[RESOLUTION]
 
 # ---------------------------------------------------------------------------
-# Target search
+# Core
 # ---------------------------------------------------------------------------
+WIN_SETTLE_MS_MIN = 150        # ms to wait after each window switch (min)
+WIN_SETTLE_MS_MAX = 200        # ms to wait after each window switch (max)
+
 TARGET_NOT_FOUND_TIMEOUT = 120   # seconds before "no new mobs" Telegram + stop
 
-# ---------------------------------------------------------------------------
-# Mob HP monitoring
-# ---------------------------------------------------------------------------
-MOB_HP_LOW_PCT  = 5    # lower end of "kill zone" range
-MOB_HP_HIGH_PCT = 30    # upper end of "kill zone" range
-
-HP_CHECK_INTERVAL   = 0.0   # seconds between mob HP reads
-HP_SWITCH_EVERY     = 5     # switch windows every N checks
-
-LOW_HP_TIMEOUT_MIN  = 20   # random timeout waiting for mob HP to enter range
-LOW_HP_TIMEOUT_MAX  = 25
-
-HP_STALL_S   =  8     # if mob HP has not dropped below HP_STALL_PCT within this many
-                      # seconds, restart target search (no recovery, no timeout count)
-HP_STALL_PCT = 99.5   # HP% treated as "not yet damaged"
-HP_STALL_JITTER_MIN = 0   # random extra wait (seconds) before the stall action fires,
-HP_STALL_JITTER_MAX = 3   # so multiple characters don't all react at the exact same time
-# Single-window assist stall: wait after the LMB burst before restarting Phase 1
-SA_STALL_WAIT_MIN      = 3    # seconds
-SA_STALL_WAIT_MAX      = 6
-# Interval between F5 presses in the recovery F5 loop.
-# During this gap the bot runs buff/death/party-anchor checks.
-SA_F5_LOOP_INTERVAL_S  = 5.0  # seconds
-
-HP_ANCHOR_MISS_LIMIT = 2   # consecutive checks without bag_mob_anchor → restart cycle
-
-# ---------------------------------------------------------------------------
-# Mob death monitoring
-# ---------------------------------------------------------------------------
-DEATH_CHECK_INTERVAL = 0.005   # seconds between mob_dead image checks
-DEATH_SWITCH_EVERY   = 5
-DEATH_TIMEOUT        = 15.0  # seconds before "waited too long to die" handling
-
-# ---------------------------------------------------------------------------
-# Anchor template matching
-# ---------------------------------------------------------------------------
-ANCHOR_CONFIDENCE         = 0.80  # matchTemplate threshold for all anchors
-PARTY_ANCHOR_CONFIDENCE   = 0.75  # lower threshold for party_pl_anchor — template varies across machines
-DC_CONFIDENCE             = 0.80  # matchTemplate threshold for disconnect.png
-ANCHOR_CACHE_PADDING = 90    # px padding around cached anchor for fast re-verify
-# bag_mob_anchor and char_bars_anchor are only searched within the top
-# ANCHOR_TOP_REGION_PX rows of the screen (full-screen search only; cached
-# hits are always accepted regardless of position).
-ANCHOR_TOP_REGION_PX = 200
-
-# ---------------------------------------------------------------------------
-# Character HP / mana thresholds
-# ---------------------------------------------------------------------------
-CHAR_HP_CRITICAL_PCT =  20   # below this → press F7 (strong potion)
-CHAR_HP_LOW_PCT      =  50   # below this (but >= CRITICAL) → press F6
-CHAR_MANA_HIGH_PCT   =  80   # above this AND mob HP > 70% → press F2
-POTION_COOLDOWN_S    =  15   # minimum seconds between consecutive F6 or F7 presses
-BUFF_NOTIFY_COOLDOWN_S = 300   # minimum seconds between "full buff expired" Telegram messages
-
-# ---------------------------------------------------------------------------
-# Key press timing defaults
-# ---------------------------------------------------------------------------
-KEY_HOLD_MIN_MS  =  75    # default random hold range for all keys
-KEY_HOLD_MAX_MS  = 150
-WASD_HOLD_MAX_MS = 200    # WASD keys during timeout recovery can hold longer
-
-# Nexttarget-mode attack: F1 spam after target acquisition
-NEXTTARGET_ATTACK_COUNT_MIN      =   2    # F1 presses per target
-NEXTTARGET_ATTACK_COUNT_MAX      =   2
-NEXTTARGET_ATTACK_HOLD_MIN_MS    =  70    # hold duration for each F1 press (ms)
-NEXTTARGET_ATTACK_HOLD_MAX_MS    = 120
-NEXTTARGET_ATTACK_INTERVAL_MIN_MS=  50    # gap between consecutive F1 presses (ms)
-NEXTTARGET_ATTACK_INTERVAL_MAX_MS= 100
-
-# Assist-mode targeting: right-click burst (recorded avg 3-4 clicks)
-ASSIST_RMB_COUNT_MIN             =   4    # right-clicks per targeting burst
-ASSIST_RMB_COUNT_MAX             =   5
-ASSIST_RMB_INTERVAL_MIN_MS       =  40    # gap between right-clicks within a burst (ms)
-ASSIST_RMB_INTERVAL_MAX_MS       =  75
-ASSIST_RMB_MAX_ATTEMPTS          =   2    # burst retries per visit before switching to the other window
-ASSIST_SEARCH_RETRY_MIN_MS       = 0    # random delay before each first RMB burst (ms)
-ASSIST_SEARCH_RETRY_MAX_MS       = 800
-ASSIST_REQUIRE_PARTY_ANCHOR      = True # True → stop if party_pl_anchor disappears; False → skip check, keep cycling
-
-# When True: both-assist windows follow *separate* party leaders.
-# Each window alternates every HP_SWITCH_EVERY checks; F2 is pressed only on
-# the window whose mob enters the kill zone; no synchronized kill phase.
-ASSIST_INDEPENDENT               = False
-
-# Assist-mode attack: F2 spam after right-click targeting
-ASSIST_ATTACK_COUNT_MIN          =   2    # key presses per visit (F1 or F2 depending on setup)
-ASSIST_ATTACK_COUNT_MAX          =   3
-ASSIST_ATTACK_HOLD_MIN_MS        =  60    # hold duration per press (ms)
-ASSIST_ATTACK_HOLD_MAX_MS        = 120
-ASSIST_ATTACK_INTERVAL_MIN_MS    =  60    # gap between consecutive presses (ms)
-ASSIST_ATTACK_INTERVAL_MAX_MS    = 100
-
-# ---------------------------------------------------------------------------
-# Single-window assist — phase-based target acquisition (SA_*)
-# ---------------------------------------------------------------------------
-# Phase 1: single RMB click at assist_point, wait, check bag_mob_anchor
-SA_RMB_ATTEMPTS      =    3    # RMB clicks per normal-mode attempt
-SA_RMB_WAIT_MS       =  450    # ms to wait after each RMB before checking
-
-# Phase 2: press F5, wait, check bag_mob_anchor
-SA_F5_ATTEMPTS       =    1    # F5 presses per normal-mode attempt
-SA_F5_WAIT_MS        =  450    # ms to wait after each F5 before checking
-
-# Phase 3: healer-area fallback when both phases 1 & 2 failed
-SA_HEALER_CLICK_AREA      =  200    # side (px) of the click area centred on healer_farm_anchor
-SA_HEALER_PRE_DELAY_MIN   =  0.1    # minimum random pause before starting healer clicks (s)
-SA_HEALER_PRE_DELAY_MAX   =  2.0    # maximum random pause before starting healer clicks (s)
-SA_HEALER_POST_PAUSE_MIN  =  1.0    # pause after last click before F5 loop starts (s)
-SA_HEALER_POST_PAUSE_MAX  =  3.0
-SA_HEALER_CLICK_PROX_MIN  =   50    # each click ≥ this many px from the previous one
-SA_HEALER_CLICK_PROX_MAX  =  100    # each click ≤ this many px from the previous one
-# Exclusion zone directly below the healer centre (upper-half anchor only)
-SA_HEALER_EXCL_W          =   30    # width  of the below-healer exclusion zone (px)
-SA_HEALER_EXCL_H          =   60    # height of the below-healer exclusion zone (px)
-SA_CAMERA_ROTATE_DX       =  550    # horizontal drag distance for a 180° camera rotation (blind fallback)
-# Smart camera orientation (minimap arrow detection)
-CAMERA_ORIENT_TOL_DEG    =    5    # stop correcting when |error| <= this value (deg)
-CAMERA_ORIENT_MAX_ITER   =    8    # safety cap on correction iterations
-CAMERA_ORIENT_SETTLE_S   =  0.3    # wait after each drag before re-reading arrow (s)
-# No-healer fallback (used when healer_farm_anchor is not found even after rotation)
-SA_FALLBACK_DELAY_MIN     =  0.1    # minimum random pause before fallback clicks (s)
-SA_FALLBACK_DELAY_MAX     =  2.0    # maximum random pause before fallback clicks (s)
-SA_FALLBACK_CLICK_AREA    =  200    # side (px) of the centered clickable square
-SA_FALLBACK_EXCL_W        =   40    # width  of centre exclusion zone for 1st click
-SA_FALLBACK_EXCL_H        =   80    # height of centre exclusion zone for 1st click
-SA_FALLBACK_CLICK2_GAP_MAX=  500    # max ms between 1st and 2nd fallback click
-SA_FALLBACK_CLICK_PROX_MIN=   50    # min px distance between the two fallback clicks
-SA_FALLBACK_CLICK_PROX_MAX=  100    # max px distance between the two fallback clicks
-
-# Phase 4: approach via double-clicks when in_target_blue is too far from center
-# SA_ATTACK_BEFORE_APPROACH:
-#   True  — press ASSIST_ATTACK_COUNT immediately when the target is confirmed,
-#            then approach (current / original behaviour).
-#   False — skip the initial attack press; if the mob is already within
-#            SA_APPROACH_PX just attack once; otherwise approach first and
-#            only attack after the character is close enough.
-SA_ATTACK_BEFORE_APPROACH  = True
-# Pre-attack delay when SA_ATTACK_BEFORE_APPROACH = True.
-# For each new mob: 90 % chance → uniform [MIN, MAX] seconds before pressing
-# ASSIST_ATTACK_COUNT; 10 % chance → a longer [LONG_MIN, LONG_MAX] interval.
-SA_PRE_ATTACK_DELAY_MIN      =  0.0  # normal delay lower bound (s)
-SA_PRE_ATTACK_DELAY_MAX      =  1  # normal delay upper bound (s)
-SA_PRE_ATTACK_DELAY_LONG_MIN =  1.5  # long-delay lower bound (s)
-SA_PRE_ATTACK_DELAY_LONG_MAX =  3.0  # long-delay upper bound (s)
-SA_PRE_ATTACK_LONG_CHANCE    =  0.10 # probability (0–1) of using the long delay
-SA_APPROACH_SKIP_PX        =  120   # before approach: if mob already within this distance, skip
-                               #   all ground clicks and attack immediately
-SA_APPROACH_STOP_PX        =  300   # during approach polling: if mob closes to within this
-                               #   distance, stop remaining clicks and attack immediately
-SA_APPROACH_MIN_DCLK       =    1   # min double-clicks chosen upfront per mob
-SA_APPROACH_MAX_DCLK       =    4   # max double-clicks chosen upfront per mob
-# Downward corridor bias that compensates for the isometric perspective.
-# When the mob is at 3/9 o'clock the blue dots sit above the mob's ground
-# position; shifting the corridor target down brings clicks closer to the
-# actual body.  Scales with abs(sin(angle_from_vertical)) = |ux|:
-#   12/6 o'clock → 0 px offset
-#   3/9  o'clock → SA_APPROACH_DOWN_OFFSET_MAX px offset
-SA_APPROACH_DOWN_OFFSET_MAX =   35   # px — tune to your camera angle
-SA_CORRIDOR_W        =    80    # perpendicular spread of the click corridor (px).
-                               # 0 = click exactly along the line from screen center
-                               # to mob — recommended for isometric games where
-                               # vertical offset maps to 3D depth, not sideways movement.
-SA_CORRIDOR_MAX_RATIO =  0.60  # clicks are placed at most this fraction of the
-                               # total distance from screen centre to the mob.
-                               # 0.85 = stop 15% short of the mob to avoid overshooting.
-# Distance-driven click timing (replaces fixed per-click delays)
-# After each double-click, the bot polls at SA_APPROACH_POLL_MS intervals and
-# fires the next click once the character has closed to within
-#   d_now  ≤  d_remaining + SA_NEXT_CLICK_LEAD_PX
-# where d_remaining = pixel distance from the click point to the mob's dot
-# centre at the moment of clicking, and d_now = current distance from screen
-# centre to the mob's dot centre.
-SA_NEXT_CLICK_LEAD_PX    =   250   # px lead before the next click fires
-SA_APPROACH_POLL_MS      =   50   # poll interval (ms) during approach
-SA_APPROACH_MAX_WAIT_MIN_MS  = 5000   # safety cap: min ms to wait per click before giving up
-SA_APPROACH_MAX_WAIT_MAX_MS  = 8000   # safety cap: max ms to wait per click before giving up
-# Minimum distance from screen centre that a click must be placed.
-# Prevents placing clicks so close that the character arrives before the
-# next poll cycle can even fire.
-SA_FIRST_CLICK_MIN_PX    =  150   # minimum px for the very first click in the series
-SA_NEXT_CLICK_MIN_PX     =  100   # minimum px for all subsequent clicks
-# Final fallback click after all SA_APPROACH_MAX_DCLK clicks are exhausted
-# without reaching SA_APPROACH_PX.  One double-click is placed in a
-# SA_APPROACH_FINAL_AREA × SA_APPROACH_FINAL_AREA box below the dot centre,
-# excluding a SA_APPROACH_FINAL_EXCL_W × SA_APPROACH_FINAL_EXCL_H zone
-# directly at/below the dot centre.  Then the bot waits 3–5 s for the
-# character to arrive before attacking regardless.
-SA_APPROACH_FINAL_AREA         = 100   # px – side of the click area below the dot
-SA_APPROACH_FINAL_EXCL_W       =  20   # px – exclusion zone width  around dot centre
-SA_APPROACH_FINAL_EXCL_H       =  40   # px – exclusion zone height below dot centre
-SA_APPROACH_FINAL_WAIT_MIN_MS  = 3000  # ms – minimum wait after final fallback click
-SA_APPROACH_FINAL_WAIT_MAX_MS  = 5000  # ms – maximum wait after final fallback click
-
-# ---------------------------------------------------------------------------
-# NC (name-click) targeting mode
-# ---------------------------------------------------------------------------
-# In "nc" mode the bot finds mob name templates on screen, filters out any
-# that already have a targeted_red / targeted_blue dot, and Shift+clicks the
-# nearest unoccupied name relative to the configured screen center.
-NC_CENTER_OFFSET_X     =   30    # shift reference center this many px to the left (0 = screen mid)
-NC_CLICK_BELOW_PX      =  30    # click this many px below the detected name center
-NC_WAIT_AFTER_CLICK_MS = 250    # ms to wait after clicking before checking bag_mob_anchor
-NC_CONFIDENCE          =  0.80  # matchTemplate threshold for mob_name and dot templates
-NC_DOT_HALF_W          = 150    # half-width of the dot-check region around each name center X
-NC_DOT_HEIGHT          =  14    # height of the dot-check region  (1px margin + 12px dot + 1px)
-NC_NMS_DIST            =  50    # min px distance between two accepted name hits (dedup)
-NC_WAIT_NO_MOB_MS      = 200    # ms to wait when no valid mob name is found before retry
-
-# ---------------------------------------------------------------------------
-# Post-timeout recovery
-# ---------------------------------------------------------------------------
-RECOVERY_WAIT_MIN = 3    # seconds to wait after timeout handler
+RECOVERY_WAIT_MIN = 3    # seconds to wait after post-timeout recovery
 RECOVERY_WAIT_MAX = 6
+
+# Anchor template matching
+ANCHOR_CONFIDENCE         = 0.80  # matchTemplate threshold for all anchors
+PARTY_ANCHOR_CONFIDENCE   = 0.75  # lower threshold for party_pl_anchor
+DC_CONFIDENCE             = 0.80  # matchTemplate threshold for disconnect.png
+ANCHOR_CACHE_PADDING      =   90  # px padding around cached anchor for fast re-verify
+# bag_mob_anchor is only searched within the top ANCHOR_TOP_REGION_PX rows of
+# the screen (full-screen search only; cached hits are accepted regardless).
+ANCHOR_TOP_REGION_PX      =  200
+# Tight ROI for bag_mob_anchor on Full HD — replaces the full 1920×200 strip.
+# (x1, y1, x2, y2) absolute pixel coordinates; None = fall back to max_y search.
+BAG_MOB_ANCHOR_ROI_FHD: tuple = (692, 73, 1387, 163)
+
+# Mob HP monitoring
+MOB_HP_LOW_PCT       =   5    # lower end of the "kill zone" HP range
+MOB_HP_HIGH_PCT      =  80    # upper end
+HP_CHECK_INTERVAL    = 0.0    # seconds between mob HP reads
+HP_SWITCH_EVERY      =   5    # switch windows every N checks
+LOW_HP_TIMEOUT_MIN   =  20    # random timeout waiting for mob HP to enter range (s)
+LOW_HP_TIMEOUT_MAX   =  25
+HP_STALL_S           =   8    # if HP has not dropped below HP_STALL_PCT within this
+                               # many seconds, restart target search
+HP_STALL_PCT         = 99.5   # HP% treated as "not yet damaged"
+HP_STALL_JITTER_MIN  =   0    # random extra wait before stall fires (s) — staggers bots
+HP_STALL_JITTER_MAX  =   3
+HP_ANCHOR_MISS_LIMIT =   2    # consecutive misses without bag_mob_anchor → restart cycle
+
+# Mob death monitoring
+DEATH_CHECK_INTERVAL = 0.005  # seconds between mob_dead checks
+DEATH_SWITCH_EVERY   =   5
+DEATH_TIMEOUT        = 15.0   # seconds before "waited too long to die" handling
+
+# Character HP / mana thresholds
+CHAR_HP_CRITICAL_PCT   =  20  # below this → F7 (strong potion)
+CHAR_HP_LOW_PCT        =  50  # below this (but ≥ CRITICAL) → F6
+CHAR_MANA_HIGH_PCT     =  80  # above this AND mob HP > 70 % → F2
+POTION_COOLDOWN_S      =  15  # min seconds between consecutive F6/F7 presses
+BUFF_NOTIFY_COOLDOWN_S = 300  # min seconds between "full buff expired" Telegram msgs
+
+# Key press timing defaults
+KEY_HOLD_MIN_MS  =  75    # default random hold range for all keys (ms)
+KEY_HOLD_MAX_MS  = 150
+WASD_HOLD_MAX_MS = 200    # WASD keys during timeout recovery
+
+# ---------------------------------------------------------------------------
+# Assist
+# ---------------------------------------------------------------------------
+
+# --- Two-window assist targeting ---
+ASSIST_RMB_COUNT_MIN          =   4    # right-clicks per targeting burst
+ASSIST_RMB_COUNT_MAX          =   5
+ASSIST_RMB_INTERVAL_MIN_MS    =  40    # gap between clicks within a burst (ms)
+ASSIST_RMB_INTERVAL_MAX_MS    =  75
+ASSIST_RMB_MAX_ATTEMPTS       =   2    # burst retries before switching windows
+ASSIST_SEARCH_RETRY_MIN_MS    =   0    # random delay before first RMB burst (ms)
+ASSIST_SEARCH_RETRY_MAX_MS    = 800
+ASSIST_REQUIRE_PARTY_ANCHOR   = True   # stop if party_pl_anchor disappears
+# When True: both windows follow separate party leaders (independent kill phase).
+ASSIST_INDEPENDENT            = False
+
+# --- Two-window assist attack ---
+ASSIST_ATTACK_COUNT_MIN       =   2    # F1/F2 presses per visit
+ASSIST_ATTACK_COUNT_MAX       =   3
+ASSIST_ATTACK_HOLD_MIN_MS     =  60    # hold duration per press (ms)
+ASSIST_ATTACK_HOLD_MAX_MS     = 120
+ASSIST_ATTACK_INTERVAL_MIN_MS =  60    # gap between consecutive presses (ms)
+ASSIST_ATTACK_INTERVAL_MAX_MS = 100
+
+# --- Single-window assist — RMB acquisition ---
+SA_RMB_ATTEMPTS   =   1    # RMB clicks per normal-mode attempt
+SA_RMB_WAIT_MS    = 350    # ms to wait after each RMB before checking
+
+# Stall handling for single-window assist
+SA_STALL_WAIT_MIN =   3    # wait after LMB burst before restarting Phase 1 (s)
+SA_STALL_WAIT_MAX =   6
+
+# --- SA approach thresholds (shared by both "a" and "ac" modes) ---
+# SA_APPROACH_SKIP_PX: before any ground clicks — if bag_mob_anchor is found
+#   and pair_center is already within this distance, skip movement and attack.
+# SA_APPROACH_STOP_PX: during approach polling — stop all ground clicks and
+#   attack as soon as pair_center closes within this distance.
+SA_APPROACH_SKIP_PX = 120
+SA_APPROACH_STOP_PX = 200
+
+# --- SA camera ---
+SA_CAMERA_ROTATE_DX    =  750  # drag px for a blind 180° camera turn (fallback)
+CAMERA_ORIENT_TOL_DEG  =    5  # stop correcting when |error| ≤ this (deg)
+CAMERA_ORIENT_MAX_ITER =    8  # safety cap on correction iterations
+CAMERA_ORIENT_SETTLE_S =  0.3  # wait after each drag before re-reading arrow (s)
+
+# --- SA ground-click blue-glow verification ---
+SA_GROUND_CHECK_DELAY_MS =  300  # ms to wait after click before capturing
+SA_GROUND_CHECK_W        =  100  # capture region width  around click point (px)
+SA_GROUND_CHECK_H        =  100  # capture region height around click point (px)
+SA_GROUND_HUE_LO         =   90  # blue hue lower bound (OpenCV 0–180)
+SA_GROUND_HUE_HI         =  135  # blue hue upper bound
+SA_GROUND_SAT_LO         =   50  # min saturation — glow is relatively desaturated
+SA_GROUND_SAT_HI         =  130  # max saturation — excludes in_target_blue (avg 139–206)
+SA_GROUND_VAL_LO         =  140  # min brightness
+SA_GROUND_MIN_PX         =    3  # min blue pixels to count as confirmed ground click
+SA_MA_ANCHOR_DEBUG       = False  # save the detection frame whenever ma_anchor is found, to logs/ma_debug/
+
+# --- SA fallback ground clicks (when SA_RMB_ATTEMPTS all fail) ---
+SA_FALLBACK_DELAY_MIN      =  0.0  # pre-delay before fallback clicks (s)
+SA_FALLBACK_DELAY_MAX      =  5.0
+SA_FALLBACK_CLICK_AREA     =  50  # side (px) of the centred click area
+SA_FALLBACK_EXCL_W         =   25  # exclusion zone width  directly below area centre
+SA_FALLBACK_EXCL_H         =   40  # exclusion zone height directly below area centre
+SA_FALLBACK_CLICK2_GAP_MAX =  500  # max ms between 1st and 2nd fallback click
+SA_FALLBACK_CLICK_PROX_MIN =   20  # min px from click 1 for click 2
+SA_FALLBACK_CLICK_PROX_MAX =   50  # max px from click 1 for click 2
+SA_FALLBACK_SKIP_CHANCE    = 0.15  # probability of skipping ground clicks entirely
+
+# --- SA "a" mode — MA-anchor approach (ma_anchor.png drives movement) ---
+# ma1/ma2  → detected during buff/death checks; used only as the RMB point.
+# ma_anchor → separately detected; centres the 150×150 ground-click area.
+# pair_center (blue/red dots) → used only for SKIP_PX / STOP_PX distance checks.
+SA_MA_CONFIDENCE      = 0.80  # matchTemplate threshold for ma1/ma2 and ma_anchor
+SA_MA_CLICK_AREA      =  50  # side (px) of ground-click area centred on ma_anchor
+SA_MA_LEAD_PX         =  800  # trigger next click when d_anchor ≤ d_remaining + LEAD
+SA_MA_MIN_CLICK_PX    =  10  # minimum click distance from screen centre (px)
+SA_MA_CLOSE_PX        =  100  # stop normal ground clicks when ma_anchor is within this dist
+SA_MA_FALLBACK_CHANCE = 0  # chance to perform 1–2 close-zone fallback clicks
+
+# Directional click-region offset — applied when ma_anchor is far from the
+# screen centre (dist ≥ SA_MA_OFFSET_TRIGGER_PX).  Positions SA_MA_CLICK_AREA
+# beyond ma_anchor instead of centring it on ma_anchor, compensating for the
+# isometric perspective.  Set SA_MA_REGION_OFFSET_PX = 0 to disable the offset
+# while keeping the trigger active.
+SA_MA_DIRECTION_X_WEIGHT: float = 1.0   # horizontal weight on the centre→anchor
+                                         # direction vector before normalisation.
+                                         # 1.0 = raw direction; higher = more
+                                         # sideways; no effect at 12/6 o'clock.
+SA_MA_REGION_OFFSET_PX: int   =  50     # px from anchor centre to the NEAREST
+                                         # EDGE of SA_MA_CLICK_AREA
+SA_MA_OFFSET_TRIGGER_PX: int  = 200     # min dist (screen centre → anchor) for
+                                         # the directional offset to activate;
+                                         # closer → normal centred-on-anchor click
+
+# Exclusion zones shared by ma_anchor AND in_target_blue/red detection.
+# Applied only when the captured frame is exactly 1920×1080 (FHD).
+# Each entry is (x1, y1, x2, y2) in inclusive screen-pixel coordinates.
+# Detections whose centre falls inside any of these rectangles are suppressed.
+# Ground-click points generated inside an excluded zone are pushed 2 px past
+# the nearest boundary of that zone before the LMB is sent.
+SA_EXCL_ROIS_FHD: list = [
+    (   0,    0,  384,   56),  # top-left corner (character/party bars)
+    ( 844,    0, 1249,  110),  # top-center band (target window)
+    (1642,    0, 1919,  275),  # top-right strip (minimap + buffs)
+    (   0,  200,  260,  686),  # left strip — narrow segment
+    (   0,  686,  381, 1048),  # left strip — wide segment
+    ( 752,  837, 1273, 1048),  # bottom-center block (inventory / skills)
+    (1868,  922, 1919,  990),  # bottom-right small stub
+    (1504,  992, 1919, 1048),  # bottom-right large block
+    (   0, 1049, 1919, 1079),  # bottom strip (system bar)
+]
+
+# Legacy single-ROI kept for reference; superseded by SA_EXCL_ROIS_FHD above.
+# SA_MA_ANCHOR_EXCL_ROI: tuple = (875, 0, 1225, 101)
+
+# --- SA "ac" mode — crosshair corridor approach (in_target_blue/red drives movement) ---
+SA_ATTACK_BEFORE_APPROACH   = True   # True  → attack immediately on confirmation, then approach
+                                     # False → approach first; attack only once within STOP_PX
+# Pre-attack delay (SA_ATTACK_BEFORE_APPROACH = True only).
+# 90 % chance → [MIN, MAX] s;  10 % chance → [LONG_MIN, LONG_MAX] s.
+SA_PRE_ATTACK_DELAY_MIN      =  0.0
+SA_PRE_ATTACK_DELAY_MAX      =  1.0
+SA_PRE_ATTACK_DELAY_LONG_MIN =  2.0
+SA_PRE_ATTACK_DELAY_LONG_MAX =  4.0
+SA_PRE_ATTACK_LONG_CHANCE    = 0.10
+
+SA_APPROACH_MIN_DCLK         =   1   # min double-clicks chosen upfront per mob
+SA_APPROACH_MAX_DCLK         =   4   # max double-clicks chosen upfront per mob
+# Isometric perspective correction: shift corridor target down when mob is
+# near 3/9 o'clock.  Scales with |ux| (0 at 12/6, 1 at 3/9 o'clock).
+SA_APPROACH_DOWN_OFFSET_MAX  =  35   # px — tune to your camera angle
+SA_CORRIDOR_W                =  80   # perpendicular spread of the click corridor (px)
+SA_CORRIDOR_MAX_RATIO        = 0.60  # clicks placed at most this fraction of path to mob
+# Distance-driven next-click trigger.
+# Next click fires when: d_now ≤ d_remaining + SA_NEXT_CLICK_LEAD_PX
+SA_NEXT_CLICK_LEAD_PX        = 250   # px lead before the next click fires
+SA_APPROACH_POLL_MS          =  0   # poll interval (ms) during approach
+SA_APPROACH_MAX_WAIT_MIN_MS  = 5000  # safety cap: min ms to wait per click before forcing next
+SA_APPROACH_MAX_WAIT_MAX_MS  = 8000  # safety cap: max ms
+SA_FIRST_CLICK_MIN_PX        = 150   # min px from screen centre for the very first click
+SA_NEXT_CLICK_MIN_PX         = 100   # min px from screen centre for subsequent clicks
+# Final fallback: after all SA_APPROACH_MAX_DCLK clicks without reaching STOP_PX,
+# place one last double-click below the dot centre, then wait and attack.
+SA_APPROACH_FINAL_AREA        = 100  # side (px) of the click area below dot centre
+SA_APPROACH_FINAL_EXCL_W      =  20  # exclusion zone width  around dot centre
+SA_APPROACH_FINAL_EXCL_H      =  40  # exclusion zone height below dot centre
+SA_APPROACH_FINAL_WAIT_MIN_MS = 3000 # min wait after final click (ms)
+SA_APPROACH_FINAL_WAIT_MAX_MS = 5000 # max wait after final click (ms)
+
+# ---------------------------------------------------------------------------
+# NextTarget
+# ---------------------------------------------------------------------------
+
+# NextTarget attack (F1 spam after target acquisition)
+NEXTTARGET_ATTACK_COUNT_MIN       =   2   # F1 presses per target
+NEXTTARGET_ATTACK_COUNT_MAX       =   2
+NEXTTARGET_ATTACK_HOLD_MIN_MS     =  70   # hold duration for each F1 press (ms)
+NEXTTARGET_ATTACK_HOLD_MAX_MS     = 120
+NEXTTARGET_ATTACK_INTERVAL_MIN_MS =  50   # gap between consecutive F1 presses (ms)
+NEXTTARGET_ATTACK_INTERVAL_MAX_MS = 100
+
+# NC (name-click) targeting: Shift+click nearest unoccupied mob name template
+NC_CENTER_OFFSET_X     =  30   # shift reference centre this many px left (0 = screen mid)
+NC_CLICK_BELOW_PX      =  30   # click this many px below the detected name centre
+NC_WAIT_AFTER_CLICK_MS = 250   # ms to wait after clicking before checking bag_mob_anchor
+NC_CONFIDENCE          = 0.80  # matchTemplate threshold for mob_name and dot templates
+NC_DOT_HALF_W          = 150   # half-width of the dot-check region around each name X
+NC_DOT_HEIGHT          =  14   # height of the dot-check region
+NC_NMS_DIST            =  50   # min px distance between two accepted name hits (dedup)
+NC_WAIT_NO_MOB_MS      = 200   # ms to wait when no valid mob name is found before retry
 
 # ---------------------------------------------------------------------------
 # Hotkey Assist  (hotkey_assist.py — standalone script)
@@ -411,5 +419,5 @@ HOTKEY_STOP_KEY = "f12"       # exit hotkey_assist cleanly
 # Absolute screen (x, y) of the party-bar assist point in each window.
 # Right-clicks (RMB burst) and left-clicks (LMB burst) land here.
 # Match the key names used in the WINDOWS dict above ("win1", "win2", …).
-HOTKEY_WIN1_ASSIST = (158, 158)   # ← set to actual party-bar coords
-HOTKEY_WIN2_ASSIST = (158, 158)   # ← set to actual party-bar coords
+HOTKEY_WIN1_ASSIST = (134, 290)   # ← set to actual party-bar coords
+HOTKEY_WIN2_ASSIST = (134, 290)   # ← set to actual party-bar coords

@@ -474,6 +474,25 @@ class Viewer:
                                font=("Consolas", 9), padx=6)
         self.status.pack(side="left", fill="both", expand=True)
 
+        # ── MA-anchor image selector (right side of status bar) ──────────────
+        _ma_fr = tk.Frame(_sb, bg="#1c1c1c")
+        _ma_fr.pack(side="right", padx=(0, 14))
+        tk.Label(_ma_fr, text="MA:", bg="#1c1c1c", fg="#666666",
+                 font=("Consolas", 9)).pack(side="left")
+        self._ma_select: int = 1   # 1 or 2; broadcast to all bot instances
+        self._ma_btn1 = tk.Button(
+            _ma_fr, text="1", width=2, bd=0, relief="flat", cursor="hand2",
+            bg="#2a4a2a", fg="#66cc66", activebackground="#2a4a2a",
+            font=("Consolas", 9),
+            command=lambda: self._apply_ma_select(1))
+        self._ma_btn1.pack(side="left", padx=(4, 1), ipady=1)
+        self._ma_btn2 = tk.Button(
+            _ma_fr, text="2", width=2, bd=0, relief="flat", cursor="hand2",
+            bg="#1a1a1a", fg="#555555", activebackground="#1a1a1a",
+            font=("Consolas", 9),
+            command=lambda: self._apply_ma_select(2))
+        self._ma_btn2.pack(side="left", padx=(1, 0), ipady=1)
+
         # ── Camera orientation control (right side of status bar) ──────────────
         _co = tk.Frame(_sb, bg="#1c1c1c")
         _co.pack(side="right", padx=(0, 10))
@@ -537,6 +556,20 @@ class Viewer:
         if self._orient2_var:
             self._orient2_var.set(str((deg + 180) % 360))
         msg = {"t": "camera_orient", "deg": deg}
+        for t in self.tiles:
+            t.link.send(msg)
+        self.canvas.focus_set()
+
+    def _apply_ma_select(self, n: int) -> None:
+        """Switch the active MA anchor image (1 or 2) and broadcast to all links."""
+        self._ma_select = n
+        # Update button colours: active = green, inactive = dim
+        for btn, num in ((self._ma_btn1, 1), (self._ma_btn2, 2)):
+            if num == n:
+                btn.config(bg="#2a4a2a", fg="#66cc66")
+            else:
+                btn.config(bg="#1a1a1a", fg="#555555")
+        msg = {"t": "ma_select", "n": n}
         for t in self.tiles:
             t.link.send(msg)
         self.canvas.focus_set()
@@ -1212,12 +1245,13 @@ class Viewer:
 
     # ---- keyboard ----
     def _alt_down(self, event=None):
-        """True if Alt is held, even when Tk omits the modifier bit on the digit."""
-        if self._alt_held:
-            return True
-        if event is not None and event.state & 0x20008:
-            return True
-        return False
+        """True if Alt_L is held (the deferred-combo key).
+
+        Alt_R is forwarded immediately and must never trigger tile-switch or
+        zoom-toggle logic, so this intentionally ignores the modifier-state bit
+        (which is the same for both Alt keys on Windows).
+        """
+        return self._alt_held
 
     def _pick_tile_by_digit(self, digit):
         """Alt+1…Alt+0: switch tile. Never send the combo to the slave.
@@ -1232,6 +1266,12 @@ class Viewer:
         n = (int(digit) - 1) % 10
         if n < len(self.tiles):
             self._select(n)
+            # In zoom mode _select() does not activate FPS or route keyboard —
+            # that is hover-driven.  Force hover to the new selection so the big
+            # tile is immediately active without needing a cursor move.
+            if self.zoomed:
+                self._set_hover(n)
+        self.canvas.focus_set()
 
     def _unsend_keys(self, names):
         link = self._selected_link()
@@ -1299,17 +1339,37 @@ class Viewer:
     def _on_alt_down(self, event):
         """Dedicated Alt_L / Alt_R handler.
 
-        Binding <Alt_L> directly is more specific than <KeyPress>, so Tkinter
-        dispatches it first and the "break" return prevents Windows' system-menu
-        hook from consuming the key — which was the root cause of Alt+digit
-        combos missing on fast presses.
+        Binding <Alt_L>/<Alt_R> directly is more specific than <KeyPress>, so
+        Tkinter dispatches it first and "break" prevents Windows' system-menu
+        hook from consuming the key.
+
+        Alt_L is deferred: held in _alt_held and forwarded to the slave only
+        once it is confirmed not to be an Alt+digit/backtick viewer combo.
+
+        Alt_R is forwarded immediately — it is never used for tile-switch
+        combos, so there is no reason to defer it.
         """
+        if event.keysym == "Alt_R":
+            link = self._selected_link()
+            if link is not None and "ralt" not in self.held_keys:
+                self.held_keys.add("ralt")
+                link.send({"t": "kdown", "key": "ralt"})
+            return "break"
+        # Alt_L: deferred combo logic.
         self._alt_held = True
         if bool(event.state & 0x1):          # Shift already held → layout switch
             self._flush_alt_to_slave()
         return "break"
 
     def _on_key_down(self, event):
+        # If a text-entry widget (e.g. the camera-orient field) has OS focus,
+        # don't forward to the slave — let the widget consume the keystroke.
+        # Alt+digit tile-switch still works via its dedicated root-level binding
+        # (_on_alt_digit) which bypasses this guard.
+        focused = self.root.focus_get()
+        if focused is not None and focused is not self.canvas and focused is not self.root:
+            return
+
         ctrl  = bool(event.state & 0x4)
         shift = bool(event.state & 0x1)
         ks    = event.keysym
@@ -1346,16 +1406,15 @@ class Viewer:
             self.zoomed = not self.zoomed
             self._layout_key = None
             if self.zoomed:
-                # Entering zoom mode: FPS is now hover-driven.  Drop the selected
-                # tile to idle — _set_hover will re-activate it on first mouse-move.
-                if self.selected is not None:
-                    t = self.tiles[self.selected]
-                    if not t.fps_locked:
-                        t.link.set_active(False)
+                # Entering zoom mode: immediately activate the selected tile so it
+                # streams at active FPS and receives keyboard input without needing
+                # a cursor hover first.
+                self._set_hover(self.selected)
             else:
                 # Leaving zoom mode: discard hover state; next mouse-move
                 # re-activates via the grid-mode select path.
                 self._set_hover(None)
+            self.canvas.focus_set()
             return "break"
 
         # +/- retune the active-tile frame rate.
@@ -1384,9 +1443,13 @@ class Viewer:
         return "break"
 
     def _on_key_up(self, event):
+        focused = self.root.focus_get()
+        if focused is not None and focused is not self.canvas and focused is not self.root:
+            return
+
         ks = event.keysym
 
-        if ks in ("Alt_L", "Alt_R"):
+        if ks == "Alt_L":
             used = self._alt_combo
             self._alt_held = False
             self._alt_combo = False
@@ -1395,6 +1458,8 @@ class Viewer:
                 # one somehow went out.
                 self._unsend_keys(("alt", "ralt"))
                 return "break"
+        # Alt_R was forwarded immediately on keydown; fall through to the
+        # general path which sends kup for "ralt" if it is in held_keys.
 
         # Digit that belonged to Alt+N must not produce a leftover key-up.
         if (self._alt_held or self._alt_combo) and len(ks) == 1 and ks.isdigit():
@@ -1409,8 +1474,14 @@ class Viewer:
         return "break"
 
     def _on_alt_digit(self, digit):
-        """Select tile by number via Alt+1…Alt+0 (0 = tenth tile)."""
-        self._alt_held = True
+        """Select tile by number via Alt+1…Alt+0 (0 = tenth tile).
+
+        The <Alt-Key-{d}> binding fires for both Alt_L and Alt_R combos.
+        Only intercept when Alt_L is held (_alt_held); Alt_R+digit must pass
+        through to the slave as a regular key-down (ralt already sent).
+        """
+        if not self._alt_held:
+            return          # Alt_R held — do not intercept; _on_key_down forwards digit
         self._pick_tile_by_digit(digit)
         return "break"
 
@@ -1464,6 +1535,9 @@ class Viewer:
         start = 0 if self.selected is None else self.selected
         nxt = (start + step) % game_n
         self._select(nxt)
+        if self.zoomed:
+            self._set_hover(nxt)
+        self.canvas.focus_set()
 
     def shutdown(self):
         self._panic()

@@ -816,6 +816,13 @@ class Session:
                 self._bot.set_camera_orient(deg)
             return
 
+        if t == "ma_select":
+            # Viewer is switching the active MA anchor image (1 or 2).
+            n = int(cmd.get("n", 1))
+            if self._bot is not None:
+                self._bot.set_ma_select(n)
+            return
+
         if not self.hid.connected:
             self.chan.send_json({"t": "error", "msg": "Arduino not connected; "
                                                       "input refused"})

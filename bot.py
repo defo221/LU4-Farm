@@ -141,22 +141,314 @@ def _sa_nms(pts: List[Tuple[int, int]], min_dist: int = 8) -> List[Tuple[int, in
     return kept
 
 
+def _build_valid_rects(
+        fw: int, fh: int,
+        excl_rois: List[Tuple[int, int, int, int]],
+        min_w: int = 1,
+        min_h: int = 1,
+) -> List[Tuple[int, int, int, int]]:
+    """Sweep-line decomposition of (fw × fh) minus *excl_rois*.
+
+    Returns a list of non-overlapping (x1, y1, x2, y2) rectangles (exclusive
+    upper bound) that together cover every pixel NOT inside any exclusion ROI.
+    Strips narrower than *min_w* or shorter than *min_h* are dropped.
+    """
+    y_breaks = sorted(set([0, fh]
+                          + [r[1] for r in excl_rois]
+                          + [r[3] for r in excl_rois]))
+    result: List[Tuple[int, int, int, int]] = []
+    for i in range(len(y_breaks) - 1):
+        y1, y2 = y_breaks[i], y_breaks[i + 1]
+        if y2 - y1 < min_h:
+            continue
+        blocked: List[Tuple[int, int]] = []
+        for ex1, ey1, ex2, ey2 in excl_rois:
+            if ey1 < y2 and ey2 > y1:
+                blocked.append((max(0, ex1), min(fw, ex2)))
+        blocked.sort()
+        merged: List[List[int]] = []
+        for bx1, bx2 in blocked:
+            if merged and bx1 <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], bx2)
+            else:
+                merged.append([bx1, bx2])
+        vx = 0
+        for bx1, bx2 in merged:
+            if bx1 - vx >= min_w:
+                result.append((vx, y1, bx1, y2))
+            vx = max(vx, bx2)
+        if fw - vx >= min_w:
+            result.append((vx, y1, fw, y2))
+    return result
+
+
+_VALID_RECTS_CACHE: dict = {}   # keyed by (fw, fh); computed once per resolution
+
+
+def _valid_search_rects(frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Return precomputed valid-search rects for *frame*'s resolution.
+
+    Runs the sweep-line decomposition of SA_EXCL_ROIS_FHD once and caches
+    the result.  These rects are passed to _match_best_in_rects and
+    _sa_find_blue_dots, which expand each rect by the template half-size
+    before calling matchTemplate so that every possible template-center
+    position within the rect is reachable — no blind strips at boundaries.
+    Non-FHD frames get an empty list (full-frame fallback).
+    """
+    fh, fw = frame.shape[:2]
+    key = (fw, fh)
+    if key not in _VALID_RECTS_CACHE:
+        excl = (list(getattr(cfg, "SA_EXCL_ROIS_FHD", []))
+                if fw == 1920 and fh == 1080 else [])
+        rects = _build_valid_rects(fw, fh, excl) if excl else []
+        _VALID_RECTS_CACHE[key] = rects
+        if rects:
+            total = sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in rects)
+            pct   = 100 * total // (fw * fh)
+            logger.info(
+                f"[PERF] valid_search_rects cached for {fw}×{fh}:"
+                f" {len(rects)} rects, {total // 1000}K px candidate area"
+                f" ({pct}% of full frame)"
+            )
+    return _VALID_RECTS_CACHE[key]
+
+
+def _match_best_in_rects(
+        frame: np.ndarray,
+        tmpl: np.ndarray,
+        valid_rects: List[Tuple[int, int, int, int]],
+) -> Tuple[float, int, int]:
+    """Run TM_CCOEFF_NORMED on each valid-rect crop; return global best.
+
+    Each crop is expanded by the template half-size (hw = tw//2, hh = th//2)
+    before matchTemplate so that templates centered at the very edge of a valid
+    rect are reachable.  After obtaining the per-crop best, the global center
+    is checked against the half-open invariant:
+
+        vx1 <= gcx < vx2   and   vy1 <= gcy < vy2
+
+    This is the authoritative guard: it handles even-sized templates (where the
+    expanded result map has one extra column), frame-edge clamping, and any
+    position that matchTemplate returns outside the intended center region.
+    Adjacent rects tile continuously — a center exactly on a shared boundary is
+    accepted by the right-hand rect (vx1 <= gcx).
+
+    Returns (best_score, global_cx, global_cy) in frame coordinates.
+    Falls back to a full-frame search when *valid_rects* is empty.
+    """
+    th, tw = tmpl.shape[:2]
+    fh, fw = frame.shape[:2]
+    hw, hh = tw // 2, th // 2
+    best_score = -2.0
+    best_cx = best_cy = 0
+    search = valid_rects or [(0, 0, fw, fh)]
+    for vx1, vy1, vx2, vy2 in search:
+        cx1 = max(0, vx1 - hw)
+        cy1 = max(0, vy1 - hh)
+        cx2 = min(fw, vx2 + hw)
+        cy2 = min(fh, vy2 + hh)
+        if cy2 - cy1 < th or cx2 - cx1 < tw:
+            continue
+        res = cv2.matchTemplate(frame[cy1:cy2, cx1:cx2], tmpl, cv2.TM_CCOEFF_NORMED)
+        _, sc, _, loc = cv2.minMaxLoc(res)
+        if sc > best_score:
+            gcx = cx1 + loc[0] + hw
+            gcy = cy1 + loc[1] + hh
+            if vx1 <= gcx < vx2 and vy1 <= gcy < vy2:
+                best_score = sc
+                best_cx    = gcx
+                best_cy    = gcy
+    return best_score, best_cx, best_cy
+
+
 def _sa_find_blue_dots(frame: np.ndarray,
                        tmpl: Optional[np.ndarray],
                        conf: float = 0.75,
-                       nms_dist: int = 8) -> List[Tuple[int, int]]:
-    """Return (cx, cy) centres for every in_target_blue detection in *frame*.
+                       nms_dist: int = 8,
+                       ) -> List[Tuple[int, int]]:
+    """Return (cx, cy) centres for every template detection in *frame*.
 
-    Returns an empty list when the template is None or no match is found.
+    Single full-frame cv2.matchTemplate call.  Before thresholding, result-map
+    cells whose template centre falls inside any SA_EXCL_ROIS_FHD region are
+    set to -1 so they are never returned as candidates.  NMS is applied to the
+    surviving hits.
     """
     if tmpl is None or frame is None:
         return []
     th, tw = tmpl.shape[:2]
+    fh, fw = frame.shape[:2]
+    hw, hh = tw // 2, th // 2
     res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+    excl: list = (list(getattr(cfg, "SA_EXCL_ROIS_FHD", []))
+                  if fw == 1920 and fh == 1080 else [])
+    if excl:
+        rh, rw = res.shape
+        for ex1, ey1, ex2, ey2 in excl:
+            rx1 = max(0, ex1 - hw);  rx2 = min(rw, ex2 - hw + 1)
+            ry1 = max(0, ey1 - hh);  ry2 = min(rh, ey2 - hh + 1)
+            if rx2 > rx1 and ry2 > ry1:
+                res[ry1:ry2, rx1:rx2] = -1.0
     ys, xs = np.where(res >= conf)
-    raw = [(int(x + tw // 2), int(y + th // 2)) for x, y in zip(xs, ys)]
-    raw.sort(key=lambda p: p[0])           # left-to-right for stable pairing
+    raw: List[Tuple[int, int]] = [(int(rx) + hw, int(ry) + hh)
+                                  for rx, ry in zip(xs, ys)]
+    raw.sort(key=lambda p: p[0])
     return _sa_nms(raw, nms_dist)
+
+
+def _push_outside_excl(px: int, py: int,
+                       rois: List[Tuple[int, int, int, int]],
+                       ) -> Tuple[int, int]:
+    """If (px, py) is inside any exclusion ROI, push it 2 px past the nearest edge.
+
+    Uses the shortest displacement so the corrected point stays as close as
+    possible to the original intent.  Only the first matching ROI is corrected
+    per call; ROIs in SA_EXCL_ROIS_FHD do not overlap so one pass is enough.
+    """
+    for x1, y1, x2, y2 in rois:
+        if x1 <= px <= x2 and y1 <= py <= y2:
+            orig_px, orig_py = px, py
+            dist_left  = px - x1
+            dist_right = x2 - px
+            dist_top   = py - y1
+            dist_bot   = y2 - py
+            min_d = min(dist_left, dist_right, dist_top, dist_bot)
+            if min_d == dist_left:
+                px = x1 - 2
+            elif min_d == dist_right:
+                px = x2 + 2
+            elif min_d == dist_top:
+                py = y1 - 2
+            else:
+                py = y2 + 2
+            logger.info(
+                f"[BOT] click ({orig_px},{orig_py}) was inside excl ROI"
+                f" ({x1},{y1})-({x2},{y2}) — pushed to ({px},{py})")
+            break
+    return px, py
+
+
+def _cursor_pos() -> Tuple[int, int]:
+    """Return the current OS cursor position (read-only observation)."""
+    import ctypes
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    p = _POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+    return p.x, p.y
+
+
+def _grab_screen_with_cursor() -> Optional[np.ndarray]:
+    """Capture the full screen with the real OS mouse cursor composited in.
+
+    mss/dxcam never include the cursor — Windows draws it outside the captured
+    surface — so the screen is BitBlt'd into a memory DC and the live cursor
+    bitmap is stamped on with DrawIconEx at its true hotspot-corrected
+    position.  Read-only screen/cursor observation; no input is generated.
+
+    Returns a BGR ndarray, or None if any GDI step fails.
+    """
+    import ctypes
+    from ctypes import wintypes as wt
+
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+
+    SRCCOPY, CAPTUREBLT = 0x00CC0020, 0x40000000
+    DI_NORMAL, CURSOR_SHOWING, BI_RGB = 0x0003, 0x0001, 0
+
+    # Explicit signatures are mandatory: on 64-bit Windows GDI/USER handles do
+    # not fit ctypes' default c_int and get truncated, which corrupts every
+    # subsequent call that receives them.
+    VP = ctypes.c_void_p
+    user32.GetDC.restype                    = VP
+    user32.GetDC.argtypes                   = [VP]
+    user32.ReleaseDC.argtypes               = [VP, VP]
+    user32.GetSystemMetrics.argtypes        = [ctypes.c_int]
+    user32.GetCursorInfo.argtypes           = [VP]
+    user32.GetIconInfo.argtypes             = [VP, VP]
+    user32.DrawIconEx.argtypes              = [VP, ctypes.c_int, ctypes.c_int,
+                                               VP, ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_uint, VP, ctypes.c_uint]
+    gdi32.CreateCompatibleDC.restype        = VP
+    gdi32.CreateCompatibleDC.argtypes       = [VP]
+    gdi32.CreateCompatibleBitmap.restype    = VP
+    gdi32.CreateCompatibleBitmap.argtypes   = [VP, ctypes.c_int, ctypes.c_int]
+    gdi32.SelectObject.restype              = VP
+    gdi32.SelectObject.argtypes             = [VP, VP]
+    gdi32.BitBlt.argtypes                   = [VP, ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_int, VP,
+                                               ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_uint]
+    gdi32.GetDIBits.argtypes                = [VP, VP, ctypes.c_uint,
+                                               ctypes.c_uint, VP, VP,
+                                               ctypes.c_uint]
+    gdi32.DeleteObject.argtypes             = [VP]
+    gdi32.DeleteDC.argtypes                 = [VP]
+
+    class CURSORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD),
+                    ("hCursor", wt.HANDLE), ("ptScreenPos", wt.POINT)]
+
+    class ICONINFO(ctypes.Structure):
+        _fields_ = [("fIcon", wt.BOOL), ("xHotspot", wt.DWORD),
+                    ("yHotspot", wt.DWORD), ("hbmMask", wt.HANDLE),
+                    ("hbmColor", wt.HANDLE)]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG),
+                    ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
+                    ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                    ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
+                    ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
+                    ("biClrImportant", wt.DWORD)]
+
+    w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+    hdc_screen = user32.GetDC(None)
+    if not hdc_screen:
+        return None
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    hbmp    = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+    old     = gdi32.SelectObject(hdc_mem, hbmp)
+    try:
+        if not gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0,
+                            SRCCOPY | CAPTUREBLT):
+            return None
+
+        ci = CURSORINFO()
+        ci.cbSize = ctypes.sizeof(CURSORINFO)
+        if user32.GetCursorInfo(ctypes.byref(ci)) and (ci.flags & CURSOR_SHOWING):
+            ii = ICONINFO()
+            if user32.GetIconInfo(ci.hCursor, ctypes.byref(ii)):
+                user32.DrawIconEx(hdc_mem,
+                                  ci.ptScreenPos.x - ii.xHotspot,
+                                  ci.ptScreenPos.y - ii.yHotspot,
+                                  ci.hCursor, 0, 0, 0, None, DI_NORMAL)
+                if ii.hbmMask:
+                    gdi32.DeleteObject(ii.hbmMask)
+                if ii.hbmColor:
+                    gdi32.DeleteObject(ii.hbmColor)
+
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize        = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth       = w
+        bmi.biHeight      = -h          # negative → top-down rows
+        bmi.biPlanes      = 1
+        bmi.biBitCount    = 32
+        bmi.biCompression = BI_RGB
+
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf,
+                               ctypes.byref(bmi), 0):
+            return None
+        arr = np.frombuffer(buf.raw, dtype=np.uint8).reshape((h, w, 4))
+        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    finally:
+        gdi32.SelectObject(hdc_mem, old)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(None, hdc_screen)
 
 
 def _sa_blue_pair_center(dots: List[Tuple[int, int]],
@@ -239,7 +531,8 @@ class AnchorFinder:
 
     def __init__(self, image_path: str, confidence: float = cfg.ANCHOR_CONFIDENCE,
                  padding: int = cfg.ANCHOR_CACHE_PADDING,
-                 max_y: Optional[int] = None):
+                 max_y: Optional[int] = None,
+                 roi: Optional[Tuple[int, int, int, int]] = None):
         self.path       = image_path
         self.confidence = confidence
         self.padding    = padding
@@ -247,6 +540,10 @@ class AnchorFinder:
         # Cached hits are still accepted at any position (they were already
         # verified, so restricting them would only cause unnecessary cache misses).
         self.max_y      = max_y
+        # roi = (x1, y1, x2, y2): when set, full searches are restricted to this
+        # rectangle instead of the full frame / max_y strip.  Returned coordinates
+        # are always in absolute screen space.  Overrides max_y for full searches.
+        self.roi        = roi  # Optional[Tuple[x1, y1, x2, y2]]
         self._tmpl      = cv2.imread(image_path)
         if self._tmpl is None:
             raise FileNotFoundError(f"Anchor image not found: {image_path}")
@@ -298,8 +595,24 @@ class AnchorFinder:
 
     def _full_search(self, frame: np.ndarray,
                      silent: bool = False) -> Optional[tuple[int, int]]:
-        # Restrict to top N rows so duplicate UI elements lower on screen are ignored.
-        search_frame = frame[:self.max_y] if self.max_y is not None else frame
+        # Crop the search region: ROI wins over max_y when both are set.
+        if self.roi is not None:
+            rx1, ry1, rx2, ry2 = self.roi
+            fh, fw = frame.shape[:2]
+            rx1 = max(0, rx1); ry1 = max(0, ry1)
+            rx2 = min(fw, rx2); ry2 = min(fh, ry2)
+            search_frame = frame[ry1:ry2, rx1:rx2]
+            offset_x, offset_y = rx1, ry1
+            region_str = f"ROI ({rx1},{ry1})–({rx2},{ry2})"
+        elif self.max_y is not None:
+            search_frame = frame[:self.max_y]
+            offset_x, offset_y = 0, 0
+            region_str = f"top {self.max_y}px"
+        else:
+            search_frame = frame
+            offset_x, offset_y = 0, 0
+            region_str = "full frame"
+
         if search_frame.shape[0] < self._th or search_frame.shape[1] < self._tw:
             # Search region smaller than template — cannot match.
             logger.warn(f"[ANCHOR] {self._name} search region too small"
@@ -310,13 +623,12 @@ class AnchorFinder:
         _, score, _, loc = cv2.minMaxLoc(res)
         self._last_score = score
         if score >= self.confidence:
-            self._cx = loc[0] + self._tw // 2
-            self._cy = loc[1] + self._th // 2
+            self._cx = offset_x + loc[0] + self._tw // 2
+            self._cy = offset_y + loc[1] + self._th // 2
             if not silent:
                 logger.info(f"[ANCHOR] {self._name} found at {(self._cx, self._cy)}"
                             f"  score={score:.3f}")
             return (self._cx, self._cy)
-        region_str = f"top {self.max_y}px" if self.max_y is not None else "full frame"
         if not silent:
             logger.warn(f"[ANCHOR] {self._name} NOT found in {region_str}"
                         f"  best score={score:.3f}  threshold={self.confidence:.2f}")
@@ -394,6 +706,10 @@ class WindowSlot:
     hwnd:           Optional[int]             = None
     # Per-window targeting mode — chosen interactively at startup.
     targeting_mode:        str                       = "nexttarget"  # "nexttarget" | "assist"
+    # True  — "ac" mode: crosshair was calibrated at startup; assist_point is used
+    #          for RMB clicks and the old phase-based approach (_single_assist_cycle_ac).
+    # False — "a"  mode: ma1/ma2 images are used for targeting; no crosshair.
+    assist_use_crosshair:  bool                      = False
     # Assist-mode calibration: screen point the user clicked during startup.
     # Right-clicking here targets the party leader's mob.  Reset each run.
     assist_point:          Optional[tuple[int, int]] = None
@@ -547,9 +863,17 @@ class FarmBot:
             return fb
 
         _top = cfg.ANCHOR_TOP_REGION_PX   # mob/char anchors are only in the top N px
-        self._mob_anchor   = AnchorFinder(_ap("bag_mob_anchor.png"),  max_y=_top)
+        _mob_roi = (cfg.BAG_MOB_ANCHOR_ROI_FHD
+                    if cfg.RESOLUTION == "FHD"
+                       and getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None) is not None
+                    else None)
+        self._mob_anchor   = AnchorFinder(_ap("bag_mob_anchor.png"),
+                                          max_y=(_top if _mob_roi is None else None),
+                                          roi=_mob_roi)
         self._char_anchor  = AnchorFinder(_ap("char_bars_anchor.png"), max_y=_top)
-        self._mob_dead_f   = AnchorFinder(_ap("mob_dead.png"))
+        self._mob_dead_f   = AnchorFinder(_ap("mob_dead.png"),
+                                          max_y=(_top if _mob_roi is None else None),
+                                          roi=_mob_roi)
         self._death_f      = AnchorFinder(_ap("death_screen.png"),    confidence=0.85)
         self._disconnect_f = AnchorFinder(_ap("disconnect.png"),      confidence=cfg.DC_CONFIDENCE)
         self._buff_f       = AnchorFinder(_ap("full_buff_check.png"),  confidence=0.85)
@@ -601,9 +925,23 @@ class FarmBot:
             self._healer_anchor = None
             logger.info("[BOT] healer_farm_anchor.png not found — phase-3 will rotate camera only")
 
-        # True while the bot is in the healer-area recovery loop.
-        # Cleared as soon as a post-recovery RMB succeeds.
-        self._sa_recovery_mode: bool = False
+        # MA-anchor images (ma1.png / ma2.png) for the default "a" assist mode.
+        # The viewer toggles which one is active.  Position is cached after each
+        # _check_buff_and_death() pass so the bot never re-grabs just for the RMB point.
+        def _load_ma(name: str) -> Optional[np.ndarray]:
+            p = _ap(name)
+            t = cv2.imread(p)
+            if t is None:
+                logger.warn(f"[BOT] {name} not found — ma-assist may fall back to assist_point")
+            else:
+                logger.info(f"[BOT] {name} loaded ({t.shape[1]}×{t.shape[0]}): {p}")
+            return t
+
+        self._ma1_tmpl: Optional[np.ndarray] = _load_ma("ma1.png")
+        self._ma2_tmpl: Optional[np.ndarray] = _load_ma("ma2.png")
+        self._ma_anchor_tmpl: Optional[np.ndarray] = _load_ma("ma_anchor.png")
+        self._ma_select: int = 1                          # 1 or 2; toggled by viewer
+        self._ma_pos: Optional[Tuple[int, int]] = None   # cached RMB point (ma1/ma2)
 
         # Camera orientation (set from viewer UI via stream_sender).
         # None = use the old blind SA_CAMERA_ROTATE_DX drag.
@@ -671,7 +1009,6 @@ class FarmBot:
                         logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                         capslock.wait_off()
                         logger.info("[BOT] Resumed — continuing split-assist")
-                        self._sa_recovery_mode = False
                         self._invalidate_all_caches()
                         continue
                     try:
@@ -681,7 +1018,6 @@ class FarmBot:
                         logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                         capslock.wait_off()
                         logger.info("[BOT] Resumed — continuing split-assist")
-                        self._sa_recovery_mode = False
                         self._invalidate_all_caches()
                         continue  # restart the outer while loop, not fall to StopBot
                 raise StopBot
@@ -694,7 +1030,6 @@ class FarmBot:
                     logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                     capslock.wait_off()
                     logger.info("[BOT] Resumed — continuing cycle")
-                    self._sa_recovery_mode = False
                     self._invalidate_all_caches()
                     continue
 
@@ -714,7 +1049,6 @@ class FarmBot:
                     logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                     capslock.wait_off()
                     logger.info("[BOT] Resumed — restarting from target search")
-                    self._sa_recovery_mode = False
                     self._invalidate_all_caches()
                 except CycleTimeout as e:
                     logger.warn(f"[BOT] CycleTimeout: {e}")
@@ -1017,7 +1351,6 @@ class FarmBot:
             logger.info("[BOT] Stall — restarting target search")
             opp_stall = self._opposite()
             if opp_stall is None and self._active.targeting_mode == "assist":
-                self._sa_recovery_mode = False
                 self._single_assist_cycle()
             else:
                 if self._target_search():
@@ -1166,13 +1499,15 @@ class FarmBot:
                     f"\n[{slot.title}]  Targeting —"
                     f"  [n]  NextTarget (F5)"
                     f"  [nc] NameClick  (Shift+click mob name)"
-                    f"  [a]  Assist     (right-click party bar): "
+                    f"  [a]  Assist     (ma1/ma2 image anchor — no crosshair)"
+                    f"  [ac] Assist+XH  (right-click crosshair — calibrated now): "
                 ).strip().lower()
-                if choice in ("a", "n", "nc"):
+                if choice in ("a", "ac", "n", "nc"):
                     break
-                print("  Please type 'n', 'nc', or 'a'.")
-            if choice == "a":
+                print("  Please type 'n', 'nc', 'a', or 'ac'.")
+            if choice in ("a", "ac"):
                 slot.targeting_mode = "assist"
+                slot.assist_use_crosshair = (choice == "ac")
             elif choice == "nc":
                 slot.targeting_mode = "nc"
             else:
@@ -1181,6 +1516,7 @@ class FarmBot:
 
         # If both chose assist, ask party grouping
         assist_slots = [s for s in enabled if s.targeting_mode == "assist"]
+        ac_slots     = [s for s in assist_slots if s.assist_use_crosshair]
         if len(enabled) == 2 and len(assist_slots) == 2:
             print()
             while True:
@@ -1199,8 +1535,8 @@ class FarmBot:
                           if cfg.ASSIST_INDEPENDENT else "SYNCHRONIZED (same party)")
             logger.info(f"[BOT] Both-assist mode: {mode_label}")
 
-        # ── Phase 2: crosshair calibration for each assist window ───────────
-        for slot in assist_slots:
+        # ── Phase 2: crosshair calibration — only for "ac" slots ────────────
+        for slot in ac_slots:
             print(f"\n  Switching to '{slot.title}'...")
             self._switch_to(slot)
             print(f"  A crosshair window will appear on the left side of the screen.")
@@ -1349,6 +1685,233 @@ class FarmBot:
     # Camera orientation control
     # ------------------------------------------------------------------
 
+    def set_ma_select(self, n: int) -> None:
+        """Called by stream_sender when the viewer switches the active MA image (1 or 2)."""
+        self._ma_select = int(n)
+        self._ma_pos = None   # invalidate cached position — image changed
+        logger.info(f"[BOT] MA anchor: switched to ma{self._ma_select}.png")
+
+    def _detect_ma_pos(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Find the active ma1/ma2 template in *frame*.  Returns centre pixel or None."""
+        tmpl = self._ma1_tmpl if self._ma_select == 1 else self._ma2_tmpl
+        if tmpl is None:
+            return None
+        res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(res)
+        th, tw = tmpl.shape[:2]
+        cx, cy = loc[0] + tw // 2, loc[1] + th // 2
+        if score < cfg.SA_MA_CONFIDENCE:
+            logger.info(
+                f"[BOT] ma{self._ma_select} NOT found — best score={score:.3f}"
+                f" at ({cx},{cy}), threshold={cfg.SA_MA_CONFIDENCE}"
+            )
+            return None
+        logger.info(
+            f"[BOT] ma{self._ma_select} found at ({cx},{cy}), score={score:.3f}"
+        )
+        return cx, cy
+
+    def _detect_ma_anchor_pos(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Find the ma_anchor template in *frame*.
+
+        ma_anchor.png is the in-world visual marker that tracks the mob's position
+        on screen.  It drives the ground-click area centre, the <SA_MA_CLOSE_PX
+        close-zone, and the anchor-lost / camera-rotate logic.
+
+        Single full-frame cv2.matchTemplate call.  Result-map cells whose
+        template centre falls inside any SA_EXCL_ROIS_FHD region are set to -1
+        before minMaxLoc so that UI elements are never returned as the winner.
+        """
+        tmpl = self._ma_anchor_tmpl
+        if tmpl is None:
+            return None
+        th, tw = tmpl.shape[:2]
+        fh, fw = frame.shape[:2]
+        hw, hh = tw // 2, th // 2
+
+        res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+        excl: list = (list(getattr(cfg, "SA_EXCL_ROIS_FHD", []))
+                      if fw == 1920 and fh == 1080 else [])
+        if excl:
+            rh, rw = res.shape
+            for ex1, ey1, ex2, ey2 in excl:
+                rx1 = max(0, ex1 - hw);  rx2 = min(rw, ex2 - hw + 1)
+                ry1 = max(0, ey1 - hh);  ry2 = min(rh, ey2 - hh + 1)
+                if rx2 > rx1 and ry2 > ry1:
+                    res[ry1:ry2, rx1:rx2] = -1.0
+        _, score, _, loc = cv2.minMaxLoc(res)
+        cx, cy = loc[0] + hw, loc[1] + hh
+
+        if score < cfg.SA_MA_CONFIDENCE:
+            logger.info(
+                f"[BOT] ma_anchor NOT found — best score={score:.3f}"
+                f" at ({cx},{cy}), threshold={cfg.SA_MA_CONFIDENCE}"
+            )
+            return None
+
+        self._ma_frame_id = getattr(self, "_ma_frame_id", 0) + 1
+        fid = self._ma_frame_id
+        logger.info(f"[BOT] ma_anchor found at ({cx},{cy}), score={score:.3f}"
+                    f"  frame_id={fid}")
+
+        if getattr(cfg, "SA_MA_ANCHOR_DEBUG", False):
+            # For rival-candidate enumeration we need the full result map.
+            # This extra matchTemplate only runs when debug mode is on.
+            res_dbg = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+            loc = (cx - tw // 2, cy - th // 2)
+
+            peaks = []
+            _r = res_dbg.copy()
+            for _ in range(5):
+                _, _s, _, _l = cv2.minMaxLoc(_r)
+                if _s < 0.5:
+                    break
+                _pcx, _pcy = _l[0] + tw // 2, _l[1] + th // 2
+                peaks.append((_pcx, _pcy, float(_s)))
+                _sx1, _sy1 = max(0, _l[0] - 25), max(0, _l[1] - 25)
+                _sx2 = min(_r.shape[1], _l[0] + 25)
+                _sy2 = min(_r.shape[0], _l[1] + 25)
+                _r[_sy1:_sy2, _sx1:_sx2] = -1.0
+            logger.info(
+                "[MA DEBUG] top candidates: "
+                + ", ".join(f"({px},{py})={ps:.3f}" for px, py, ps in peaks)
+            )
+            for px, py, ps in peaks[1:]:
+                if math.hypot(px - cx, py - cy) > 40 and ps >= cfg.SA_MA_CONFIDENCE:
+                    logger.warn(
+                        f"[MA DEBUG] AMBIGUOUS: rival candidate ({px},{py})"
+                        f"={ps:.3f} is {math.hypot(px-cx, py-cy):.0f}px from the"
+                        f" chosen ({cx},{cy})={score:.3f}"
+                    )
+
+            import datetime as _dt
+            ts      = _dt.datetime.now().strftime("%H-%M-%S.%f")[:-3]
+            out_dir = os.path.join("logs", "ma_debug")
+            os.makedirs(out_dir, exist_ok=True)
+            dpath   = os.path.join(out_dir, f"DET_f{fid:05d}_{ts}"
+                                            f"_x{cx}_y{cy}.png")
+            _d = frame.copy()
+            cv2.rectangle(_d, (loc[0], loc[1]), (loc[0] + tw, loc[1] + th),
+                          (0, 255, 255), 1)
+            cv2.circle(_d, (cx, cy), 20, (0, 0, 255), 2)
+            cv2.putText(_d, f"WIN {score:.3f}", (cx + 24, cy - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            for px, py, ps in peaks[1:]:
+                cv2.circle(_d, (px, py), 14, (255, 160, 0), 2)
+                cv2.putText(_d, f"{ps:.3f}", (px + 17, py - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 160, 0), 1,
+                            cv2.LINE_AA)
+            cv2.putText(_d, f"DETECTION FRAME fid={fid} win=({cx},{cy})"
+                            f" score={score:.3f}",
+                        (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.imwrite(dpath, _d)
+            logger.info(f"[MA DEBUG] detection frame saved: {dpath}")
+
+            self._ma_detect_dbg = {
+                "frame_id": fid,
+                "rect":     (loc[0], loc[1], loc[0] + tw, loc[1] + th),
+                "centre":   (cx, cy),
+                "score":    float(score),
+                "t":        time.perf_counter(),
+            }
+
+        return cx, cy
+
+    def _sa_pick_ma_pt(
+            self,
+            sc_x: int, sc_y: int,
+            ma_x: int, ma_y: int,
+            y_min: Optional[int] = None,
+            y_max: Optional[int] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """Return a random point inside SA_MA_CLICK_AREA for an MA ground click.
+
+        Two placement modes depending on distance from screen centre to anchor:
+
+        ── Normal mode (dist < SA_MA_OFFSET_TRIGGER_PX) ──────────────────────
+          SA_MA_CLICK_AREA is centred directly on (ma_x, ma_y).
+
+        ── Directional-offset mode (dist ≥ SA_MA_OFFSET_TRIGGER_PX) ──────────
+          The click region is shifted beyond ma_anchor in the direction from the
+          screen centre toward ma_anchor.  The horizontal component of that
+          direction is weighted by SA_MA_DIRECTION_X_WEIGHT before normalisation
+          (same calculation validated in test_ma_calibration.py).
+
+          Region centre = anchor
+                          + (SA_MA_REGION_OFFSET_PX + CLICK_AREA//2) × unit_dir
+
+          SA_MA_REGION_OFFSET_PX is the guaranteed empty gap between the anchor
+          centre and the nearest EDGE of SA_MA_CLICK_AREA.
+
+        SA_MA_MIN_CLICK_PX minimum distance from the screen centre is enforced
+        in both modes.  Returns None if rejection sampling exhausts 200 tries.
+        """
+        half = cfg.SA_MA_CLICK_AREA // 2
+        dist_to_anchor = math.hypot(ma_x - sc_x, ma_y - sc_y)
+
+        # ── Choose region centre ────────────────────────────────────────────
+        if dist_to_anchor >= cfg.SA_MA_OFFSET_TRIGGER_PX:
+            # Weighted unit vector from screen centre toward anchor.
+            dx = ma_x - sc_x
+            dy = ma_y - sc_y
+            wdx = dx * cfg.SA_MA_DIRECTION_X_WEIGHT
+            wdy = dy
+            wlen = math.hypot(wdx, wdy)
+            if wlen < 1e-6:           # anchor exactly at screen centre
+                nx, ny = 0.0, 1.0
+            else:
+                nx, ny = wdx / wlen, wdy / wlen
+            offset = cfg.SA_MA_REGION_OFFSET_PX + half
+            cx = ma_x + nx * offset
+            cy = ma_y + ny * offset
+        else:
+            cx = float(ma_x)
+            cy = float(ma_y)
+
+        box_x = int(round(cx))
+        box_y = int(round(cy))
+
+        # ── Rejection sampling inside the (possibly offset) square ──────────
+        for _ in range(200):
+            rx = random.randint(box_x - half, box_x + half)
+            ry = random.randint(box_y - half, box_y + half)
+            if math.hypot(rx - sc_x, ry - sc_y) < cfg.SA_MA_MIN_CLICK_PX:
+                continue
+            if y_min is not None and ry < y_min:
+                continue
+            if y_max is not None and ry > y_max:
+                continue
+            return rx, ry
+        return None
+
+    def _sa_pick_click2_pt(
+            self,
+            prev_pt: Tuple[int, int],
+            y_min: Optional[int] = None,
+            y_max: Optional[int] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """Pick the 2nd+ ground-click point relative to the previous click.
+
+        Samples at a random distance in [SA_FALLBACK_CLICK_PROX_MIN,
+        SA_FALLBACK_CLICK_PROX_MAX] from *prev_pt* using rejection sampling
+        over a random angle.  Only the optional Y-direction constraint
+        (y_min / y_max) is applied — there is no area-box restriction.
+        """
+        lo = cfg.SA_FALLBACK_CLICK_PROX_MIN
+        hi = cfg.SA_FALLBACK_CLICK_PROX_MAX
+        for _ in range(200):
+            angle = random.uniform(0.0, 2.0 * math.pi)
+            dist  = random.uniform(lo, hi)
+            rx = int(round(prev_pt[0] + dist * math.cos(angle)))
+            ry = int(round(prev_pt[1] + dist * math.sin(angle)))
+            if y_min is not None and ry < y_min:
+                continue
+            if y_max is not None and ry > y_max:
+                continue
+            return rx, ry
+        return None
+
     def set_camera_orient(self, deg: int) -> None:
         """Called by stream_sender when the viewer broadcasts a new camera orientation.
 
@@ -1368,12 +1931,16 @@ class FarmBot:
             logger.info("[BOT] Minimap orientation template bank built")
         return self._orient_bank
 
-    def _rotate_camera_smart(self) -> None:
-        """Switch the camera to the next allowed orientation.
+    def _rotate_camera_smart(self, nearest: bool = False) -> None:
+        """Align the camera to a configured orientation.
 
         When _camera_orient_1 is set (via viewer UI):
           1. Detect the current minimap-arrow angle.
-          2. Choose the target: whichever of {orient_1, orient_2} is farther away.
+          2. Choose the target:
+               nearest=False (default) — whichever of {orient_1, orient_2} is
+                 farther away (switch to opposite side).
+               nearest=True           — whichever of {orient_1, orient_2} is
+                 nearest (fine-correct after a coarse blind drag).
           3. Iteratively drag + re-detect until within ±CAMERA_ORIENT_TOL_DEG.
 
         Falls back to the blind SA_CAMERA_ROTATE_DX drag if orientation is not
@@ -1407,12 +1974,16 @@ class FarmBot:
             self.hid.drag_camera(cfg.SA_CAMERA_ROTATE_DX)
             return
 
-        # Choose the orientation that is farther from the current angle
         err_1 = min((cur - orient_1) % 360, (orient_1 - cur) % 360)
         err_2 = min((cur - orient_2) % 360, (orient_2 - cur) % 360)
-        target = orient_2 if err_1 <= err_2 else orient_1
+        if nearest:
+            # Fine-correct: go to whichever configured angle we are closest to.
+            target = orient_1 if err_1 <= err_2 else orient_2
+        else:
+            # Switch: go to whichever configured angle is farthest (opposite side).
+            target = orient_2 if err_1 <= err_2 else orient_1
         logger.info(f"[BOT] SA: camera {cur}deg -> target {target}deg "
-                    f"(orient1={orient_1}, orient2={orient_2})")
+                    f"(orient1={orient_1}, orient2={orient_2}, nearest={nearest})")
 
         for iteration in range(1, cfg.CAMERA_ORIENT_MAX_ITER + 1):
             delta = (target - cur + 180) % 360 - 180   # signed, (-180, +180]
@@ -1460,17 +2031,22 @@ class FarmBot:
             return _sa_blue_pair_center(dots)
 
         # Step 1 — optional immediate attack depending on mode.
+        # Pre-attack delay commented out — retained for other roles.
+        # if cfg.SA_ATTACK_BEFORE_APPROACH:
+        #     if random.random() < cfg.SA_PRE_ATTACK_LONG_CHANCE:
+        #         pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_LONG_MIN,
+        #                                    cfg.SA_PRE_ATTACK_DELAY_LONG_MAX)
+        #         logger.info(f"[BOT] SA: pre-attack long delay {pre_delay:.2f}s (10% roll)")
+        #     else:
+        #         pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_MIN,
+        #                                    cfg.SA_PRE_ATTACK_DELAY_MAX)
+        #         logger.info(f"[BOT] SA: pre-attack delay {pre_delay:.2f}s")
+        #     capslock.interruptible_sleep(pre_delay)
+        #     capslock.raise_if_on()
+        #     logger.info("[BOT] SA: mob confirmed — immediate attack press")
+        #     self._press_attack()
+        #     capslock.raise_if_on()
         if cfg.SA_ATTACK_BEFORE_APPROACH:
-            if random.random() < cfg.SA_PRE_ATTACK_LONG_CHANCE:
-                pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_LONG_MIN,
-                                           cfg.SA_PRE_ATTACK_DELAY_LONG_MAX)
-                logger.info(f"[BOT] SA: pre-attack long delay {pre_delay:.2f}s (10% roll)")
-            else:
-                pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_MIN,
-                                           cfg.SA_PRE_ATTACK_DELAY_MAX)
-                logger.info(f"[BOT] SA: pre-attack delay {pre_delay:.2f}s")
-            capslock.interruptible_sleep(pre_delay)
-            capslock.raise_if_on()
             logger.info("[BOT] SA: mob confirmed — immediate attack press")
             self._press_attack()
             capslock.raise_if_on()
@@ -1687,491 +2263,1028 @@ class FarmBot:
         self._press_attack()
         return True
 
-    def _sa_f5_loop(self) -> bool:
-        """Recovery F5 loop: press F5, wait SA_F5_WAIT_MS, check bag_mob_anchor.
+    # ------------------------------------------------------------------
+    # MA-anchor approach (default "a" mode — no crosshair calibration)
+    # ------------------------------------------------------------------
 
-        When bag_mob_anchor is not found, runs buff/death and party-anchor checks
-        and then sleeps for the remainder of SA_F5_LOOP_INTERVAL_S before the
-        next F5 press.  CapsLock is honoured on every iteration.
+    def _sa_ma_wait_for_anchor(
+            self,
+            mob_acquired: bool,
+    ) -> Tuple[Tuple[int, int], np.ndarray]:
+        """Rotate the camera once, then poll every 1 s until ma_anchor.png reappears.
 
-        Loops until a target is found, then calls _sa_phase4() and returns True.
+        Each poll iteration runs the full safety checks (buff / death /
+        disconnect / notifications) so no important events are missed while
+        waiting.  Returns (centre, frame) — the frame is handed back so the
+        caller can act on the detection immediately instead of re-grabbing and
+        re-matching a position it already has.
+        Raises CapsLockPause or StopBot as normal if the pause key is pressed
+        or a fatal condition is detected.
+
+        Fallback actions (executed once, immediately after the first failed
+        re-check following the camera rotation):
+
+        • mob_acquired=False  →  LMB ×3 on the cached ma1/ma2 position to
+                                  start moving toward the MA, then
+                                  ASSIST_ATTACK_COUNT (F1 ×N).
+        • mob_acquired=True   →  ASSIST_ATTACK_COUNT immediately.
+
+        When mob_acquired=True every subsequent poll also checks the distance
+        to in_target_blue/red.  If the mob is within SA_APPROACH_STOP_PX the
+        attack burst is repeated before waiting for the next poll.
         """
-        logger.info("[BOT] SA: entering F5 recovery loop"
-                    f" (interval {cfg.SA_F5_LOOP_INTERVAL_S:.0f}s)")
-        f5_count = 0
+        logger.info("[BOT] SA-MA: ma_anchor lost — rotating camera, then waiting")
+        self._rotate_camera_smart()
+        capslock.raise_if_on()
+        self._ma_pos = None   # stale ma1/ma2 position cleared
+
+        mon  = self.sct.monitors[1]
+        sc_x = mon['width']  // 2
+        sc_y = mon['height'] // 2
+
+        def _wait_dot_dist(f: np.ndarray) -> Optional[float]:
+            """Distance from screen centre to the closest blue/red dot."""
+            dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
+                                      conf=cfg.NC_CONFIDENCE,
+                                      nms_dist=cfg.NC_NMS_DIST)
+            if not dots:
+                dots = _sa_find_blue_dots(f, self._dot_red_tmpl,
+                                          conf=cfg.NC_CONFIDENCE,
+                                          nms_dist=cfg.NC_NMS_DIST)
+            if not dots:
+                return None
+            return math.hypot(dots[0][0] - sc_x, dots[0][1] - sc_y)
+
+        fallback_done = False
+        poll_n = 0
         while True:
+            poll_n += 1
             capslock.raise_if_on()
-            f5_count += 1
-            _press(self.hid, "f5")
-            capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
-            frame = self._grab()
-            self._mob_anchor.invalidate()
-            if self._mob_anchor.find(frame) is not None:
-                logger.info(f"[BOT] SA F5 loop: target found after {f5_count} F5(s)")
-                return self._sa_phase4(frame)
-
-            # Not found — run safety checks, then fill the rest of the interval.
-            t_checks = time.time()
-
-            # 1. Buff + death check
-            capslock.raise_if_on()
+            # Full safety pass — also updates self._ma_pos if ma template visible.
             self._check_buff_and_death()
+            frame      = self._grab()
+            anchor_pos = self._detect_ma_anchor_pos(frame)
+            if anchor_pos is not None:
+                logger.info(f"[BOT] SA-MA: ma_anchor reappeared at {anchor_pos}"
+                            f" (poll #{poll_n})")
+                return anchor_pos, frame
 
-            # 2. Party-leader check
-            capslock.raise_if_on()
-            if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
-                frame = self._grab()
-                if self._party_f.find(frame) is None and not self._recheck_party_anchor():
-                    msg = (f"{self._active.nickname()}: party leader not detected"
-                           f" — stopping.")
-                    logger.warn(f"[BOT] {msg}")
-                    self.tg.send(msg)
-                    raise StopBot
-
-            # 3. Disconnect check
-            capslock.raise_if_on()
-            frame = self._grab()
-            if self._disconnect_f.find(frame) is not None:
-                nick = self._active.nickname()
-                msg  = f"{cfg.PC_NUMBER}: {nick} — disconnect screen detected!"
-                logger.warn(f"[BOT] {msg}")
-                self.tg.send(msg)
-                raise StopBot
-
-            # Sleep the remaining portion of the configured interval
-            capslock.raise_if_on()
-            elapsed = time.time() - t_checks
-            remaining = cfg.SA_F5_LOOP_INTERVAL_S - elapsed
-            if remaining > 0:
-                capslock.interruptible_sleep(remaining)
-
-    def _sa_phase3_rmb_f5_loop(self, frame: np.ndarray) -> bool:
-        """RMB-first F5 loop used inside Phase-3 recovery.
-
-        Per iteration:
-          1. RMB at screen centre → delay SA_RMB_WAIT_MS → check bag_mob_anchor.
-             Found → clear _sa_recovery_mode, _sa_phase4(), return True.
-          2. x1 Esc → x1 F5 → delay SA_F5_WAIT_MS → check + full safety checks.
-             Found via F5 → kill (_sa_phase4) → F5-kill sub-loop until F5 yields
-                            no target → sleep SA_HEALER_PRE_DELAY_MAX → return False.
-             Not found    → sleep SA_HEALER_POST_PAUSE_MIN → repeat from step 1.
-
-        Returns True  – RMB acquisition succeeded; recovery mode cleared; phase4 called.
-        Returns False – F5 kill-chain exhausted; caller should restart healer-area clicks.
-        """
-        pt = self._active.assist_point
-        iteration = 0
-
-        while True:
-            capslock.raise_if_on()
-            iteration += 1
-            logger.info(f"[BOT] SA phase-3 RMB+F5 iter {iteration}")
-
-            # --- Step 1: RMB at crosshair (assist_point) -------------------------
-            if pt is not None:
-                self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
-            else:
-                logger.warn("[BOT] SA phase-3: assist_point not set — skipping RMB")
-            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
-            frame = self._grab()
-            self._mob_anchor.invalidate()
-
-            if self._mob_anchor.find(frame) is not None:
-                logger.info("[BOT] SA phase-3: target via RMB → exit recovery")
-                self._sa_recovery_mode = False
-                self._sa_phase4(frame)
-                return True
-
-            # --- Step 2: Esc + F5 ------------------------------------------------
-            capslock.raise_if_on()
-            _press(self.hid, "esc")
-            _press(self.hid, "f5")
-            capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
-            frame = self._grab()
-            self._mob_anchor.invalidate()
-            found_via_f5 = self._mob_anchor.find(frame) is not None
-
-            # Safety checks (always run)
-            capslock.raise_if_on()
-            self._check_buff_and_death()
-
-            capslock.raise_if_on()
-            if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
-                chk = self._grab()
-                if (self._party_f.find(chk) is None
-                        and not self._recheck_party_anchor()):
-                    msg = (f"{self._active.nickname()}: party leader not"
-                           " detected — stopping.")
-                    logger.warn(f"[BOT] {msg}")
-                    self.tg.send(msg)
-                    raise StopBot
-
-            capslock.raise_if_on()
-            chk = self._grab()
-            if self._disconnect_f.find(chk) is not None:
-                nick = self._active.nickname()
-                msg  = f"{cfg.PC_NUMBER}: {nick} — disconnect screen detected!"
-                logger.warn(f"[BOT] {msg}")
-                self.tg.send(msg)
-                raise StopBot
-
-            if found_via_f5:
-                logger.info("[BOT] SA phase-3: target via F5 — killing")
-
-                def _do_kill_cycle(label: str) -> bool:
-                    """Attack + full kill cycle for one mob in the F5 chain.
-
-                    Mirrors _cycle()'s flow: phase4 → _wait_low_hp → F2 →
-                    _wait_death.  Returns False if a timeout breaks the chain
-                    so the caller can exit the sub-loop early.
-                    """
-                    self._sa_phase4(frame)
-                    hp_result = self._wait_low_hp()
-                    if hp_result == "dead":
-                        logger.info(f"[BOT] SA phase-3 {label}: mob died early"
-                                    " — skipping finisher")
-                        return True
-                    if hp_result == "timeout":
-                        logger.info(f"[BOT] SA phase-3 {label}: HP wait timeout"
-                                    " — breaking F5 chain")
-                        return False
-                    # "ok" or "stalled" — press finisher and wait for death
-                    _press(self.hid, "f2")
-                    logger.info(f"[BOT] F2 in '{self._active.title}'")
-                    self._wait_death()
-                    return True
-
-                if not _do_kill_cycle("kill #1"):
-                    pre_delay = random.uniform(cfg.SA_HEALER_PRE_DELAY_MIN,
-                                               cfg.SA_HEALER_PRE_DELAY_MAX)
-                    capslock.interruptible_sleep(pre_delay)
-                    return False
-
-                # F5-kill sub-loop: keep pressing F5 until no more targets
-                kill_n = 1
-                while True:
-                    capslock.raise_if_on()
-                    _press(self.hid, "f5")
-                    capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
-                    frame = self._grab()
-                    self._mob_anchor.invalidate()
-                    if self._mob_anchor.find(frame) is not None:
-                        kill_n += 1
-                        logger.info(f"[BOT] SA phase-3: F5 kill #{kill_n}")
-                        if not _do_kill_cycle(f"kill #{kill_n}"):
-                            break
-                    else:
+            # ── Fallback actions on first failed re-check ──────────────────
+            if not fallback_done:
+                fallback_done = True
+                rmb_pt = self._ma_pos or self._active.assist_point
+                if not mob_acquired:
+                    # LMB ×3 toward the MA party-bar icon to start approaching,
+                    # then ASSIST_ATTACK_COUNT to take assist + attack.
+                    if rmb_pt is not None:
                         logger.info(
-                            f"[BOT] SA phase-3: F5 chain done after {kill_n} kill(s)")
-                        break
+                            f"[BOT] SA-MA wait: ma_anchor still absent,"
+                            f" mob not acquired — LMB ×3 on ({rmb_pt[0]},{rmb_pt[1]})")
+                        for _ in range(3):
+                            self.hid.move_to(rmb_pt[0], rmb_pt[1])
+                            self.hid.click_left_hold()
+                            capslock.interruptible_sleep(0.1)
+                    else:
+                        logger.info("[BOT] SA-MA wait: ma_anchor still absent,"
+                                    " mob not acquired — no ma pos, skipping LMB ×3")
+                    logger.info("[BOT] SA-MA wait: pressing ASSIST_ATTACK_COUNT"
+                                " after LMB ×3")
+                    self._press_attack()
+                else:
+                    # Mob already targeted — attack immediately while waiting.
+                    logger.info("[BOT] SA-MA wait: ma_anchor still absent,"
+                                " mob acquired — pressing ASSIST_ATTACK_COUNT")
+                    self._press_attack()
 
-                # Wait before returning to healer stage
-                pre_delay = random.uniform(cfg.SA_HEALER_PRE_DELAY_MIN,
-                                           cfg.SA_HEALER_PRE_DELAY_MAX)
-                logger.info(
-                    f"[BOT] SA phase-3: pre-healer wait {pre_delay:.1f}s")
-                capslock.interruptible_sleep(pre_delay)
-                return False
+            # ── Repeat attack burst when mob is close (mob_acquired path) ──
+            if mob_acquired:
+                dist = _wait_dot_dist(frame)
+                if dist is not None and dist < cfg.SA_APPROACH_STOP_PX:
+                    logger.info(
+                        f"[BOT] SA-MA wait: within SA_APPROACH_STOP_PX"
+                        f" (dist={dist:.0f}px) — pressing ASSIST_ATTACK_COUNT")
+                    self._press_attack()
 
-            # Neither RMB nor F5 found target — wait and loop
-            capslock.raise_if_on()
-            logger.info(
-                f"[BOT] SA phase-3: no target, waiting"
-                f" {cfg.SA_HEALER_POST_PAUSE_MIN:.1f}s")
-            capslock.interruptible_sleep(cfg.SA_HEALER_POST_PAUSE_MIN)
+            logger.info(f"[BOT] SA-MA: waiting for ma_anchor (poll #{poll_n})…")
+            capslock.interruptible_sleep(1.0)
 
-    def _sa_center_fallback(self, frame: np.ndarray) -> bool:
-        """No-healer fallback: 0–3 s delay, 1–2 centred clicks, then phase-3 RMB+F5 loop.
+    def _sa_ma_ground_click(
+            self,
+            trigger_reason: str,
+            mob_acquired: bool,
+            close_zone: bool,
+            hint_anchor: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]],
+               Optional[Tuple[int, int]]]:
+        """Perform at most one MA ground click, deriving the coordinate itself.
 
-        Click area  : SA_FALLBACK_CLICK_AREA × SA_FALLBACK_CLICK_AREA centred
-                      on the screen.
-        1st click   : anywhere in the area except the SA_FALLBACK_EXCL_W ×
-                      SA_FALLBACK_EXCL_H central exclusion zone.
-        2nd click   : SA_FALLBACK_CLICK_PROX_MIN..MAX px from the first click,
-                      still within the area; preceded by a 0..SA_FALLBACK_CLICK2_GAP_MAX ms gap.
+        This is the only function in the "a" assist path permitted to emit a
+        ground LMB.  It deliberately accepts no (x, y): callers decide *when* a
+        click may happen and can never influence *where* it lands.  Nothing
+        runs between the anchor detection and the physical click that could
+        substitute or adjust a coordinate.
+
+        *hint_anchor*: when the poll loop already detected ma_anchor on a fresh
+        frame (at most SA_APPROACH_POLL_MS ms ago) the caller may pass that
+        result here.  The grab+matchTemplate inside this function are then
+        skipped entirely, saving ~415 ms per click on an i5 2400.  Only pass a
+        value from the immediately preceding poll iteration.
+
+            (if hint_anchor is None)
+            fresh full-screen capture → fresh _detect_ma_anchor_pos()
+            point drawn only from SA_MA_CLICK_AREA around that anchor
+            → physical LMB
+
+        With SA_MA_CLICK_AREA = 0 the final click therefore always equals the
+        freshly detected (or just-polled) ma_anchor exactly.
+
+        Returns (frame, anchor, click_pt).  *frame* is the one the coordinate
+        was derived from (None when hint_anchor shortcut is used), *anchor* is
+        the position used, *click_pt* is None when no LMB was issued.
         """
+        if hint_anchor is not None:
+            anchor = hint_anchor
+            frame  = None
+            mon    = self.sct.monitors[1]
+            fw, fh = mon['width'], mon['height']
+            logger.info("[PERF] capture+match inside click: skipped (poll hint reused)")
+        else:
+            frame  = self._grab()
+            anchor = self._detect_ma_anchor_pos(frame)
+            if anchor is None:
+                logger.info(f"[BOT] SA-MA: click suppressed — ma_anchor not found"
+                            f"  trigger_reason={trigger_reason}")
+                return frame, None, None
+            fh, fw = frame.shape[:2]
+
+        click_pt = self._sa_pick_ma_pt(fw // 2, fh // 2, anchor[0], anchor[1])
+        if click_pt is None:
+            logger.warn(f"[BOT] SA-MA: click suppressed — no valid point in"
+                        f" SA_MA_CLICK_AREA  trigger_reason={trigger_reason}")
+            return frame, anchor, None
+
+        cx, cy = click_pt
+
+        # Push click outside any UI exclusion zone if it landed in one.
+        excl = getattr(cfg, "SA_EXCL_ROIS_FHD", []) if fw == 1920 and fh == 1080 else []
+        if excl:
+            cx, cy = _push_outside_excl(cx, cy, excl)
+        click_pt = (cx, cy)
+
+        self.hid.move_to(cx, cy)
+        act_x, act_y = _cursor_pos()
+
+        logger.info(
+            f"[BOT] SA-MA click:"
+            f"  trigger_reason={trigger_reason}"
+            f"  mob_acquired={mob_acquired}"
+            f"  close_zone={close_zone}"
+            f"  fresh_anchor=({anchor[0]},{anchor[1]})"
+            f"  final_click=({cx},{cy})"
+            f"  cursor_actual=({act_x},{act_y})"
+        )
+
+        if getattr(cfg, "SA_MA_ANCHOR_DEBUG", False):
+            self._ma_save_click_frame(anchor, (cx, cy), (act_x, act_y))
+
+        self.hid.click_left_hold()
+        return frame, anchor, click_pt
+
+    def _ma_save_click_frame(self,
+                             anchor: Tuple[int, int],
+                             click_pt: Tuple[int, int],
+                             cursor: Tuple[int, int]) -> None:
+        """Save a pre-LMB screenshot containing the real OS cursor.
+
+        Written immediately before the click so the genuine cursor bitmap can be
+        compared against the ma_anchor visible on the same capture.
+        """
+        import datetime
+
+        live = _grab_screen_with_cursor()
+        if live is None:
+            logger.warn("[MA DEBUG] GDI capture failed — no image saved")
+            return
+
+        dbg = getattr(self, "_ma_detect_dbg", None)
+        fid = dbg["frame_id"] if dbg else -1
+        cv2.circle(live, anchor, 22, (0, 0, 255), 2)
+        cv2.putText(live,
+                    f"fid={fid} anchor=({anchor[0]},{anchor[1]})"
+                    f" clk=({click_pt[0]},{click_pt[1]})"
+                    f" cur=({cursor[0]},{cursor[1]})",
+                    (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        out_dir = os.path.join("logs", "ma_debug")
+        os.makedirs(out_dir, exist_ok=True)
+        ts    = datetime.datetime.now().strftime("%H-%M-%S.%f")[:-3]
+        fpath = os.path.join(out_dir,
+                             f"f{fid:05d}_{ts}_a{anchor[0]}-{anchor[1]}"
+                             f"_clk{click_pt[0]}-{click_pt[1]}.png")
+        cv2.imwrite(fpath, live)
+        logger.info(f"[MA DEBUG] saved before LMB: {fpath}")
+        self._ma_detect_dbg = None
+
+    def _sa_ma_approach(self) -> bool:
+        """MA-image-based targeting and approach for the default assist mode.
+
+        Entry point: called at the start of every new cycle (after mob_dead or
+        after a CapsLock pause is released).
+
+        Flow
+        ----
+        1.  Grab a fresh frame; detect active ma1/ma2 anchor.
+        2.  RMB on the detected ma position (fall back to assist_point if absent).
+        3.  Wait SA_RMB_WAIT_MS, grab again.
+        4.  Check mob_anchor and blue/red dots.
+            • dots within SA_APPROACH_SKIP_PX → attack immediately → return True.
+        5.  Ground-click approach loop:
+            • Pick a point inside SA_MA_CLICK_AREA × SA_MA_CLICK_AREA centred on
+              ma_anchor, min SA_MA_MIN_CLICK_PX from the screen centre.
+            • Perform a validated ground click (blue-glow confirmation).
+            • While mob not yet acquired: RMB on ma_pos, check mob_anchor (Esc on miss).
+            • Poll until d_to_ma ≤ d_remaining + SA_MA_LEAD_PX (next-click trigger)
+              or the safety cap expires.
+            • If ma_anchor within SA_MA_CLOSE_PX: 80 % poll-only, 20 % 1-2 fallback
+              clicks centred on ma_anchor (using SA_FALLBACK_CLICK_AREA / EXCL).
+            • If ma_anchor disappears:
+                – mob_anchor present → attack + rotate camera, then continue loop.
+                – mob_anchor absent  → rotate camera, then continue loop.
+        Exit conditions (from anywhere inside the loop):
+            A.  blue/red dots within SA_APPROACH_STOP_PX → attack → return True.
+        """
+        frame = self._grab()
         fh, fw = frame.shape[:2]
         sc_x, sc_y = fw // 2, fh // 2
-        half  = cfg.SA_FALLBACK_CLICK_AREA // 2
-        ex_hw = cfg.SA_FALLBACK_EXCL_W  // 2   # exclusion half-width
-        ex_hh = cfg.SA_FALLBACK_EXCL_H  // 2   # exclusion half-height
 
-        # ---- Pre-delay ---------------------------------------------------------
-        delay = random.uniform(cfg.SA_FALLBACK_DELAY_MIN, cfg.SA_FALLBACK_DELAY_MAX)
-        logger.info(f"[BOT] SA fallback: pre-delay {delay:.1f}s")
-        capslock.interruptible_sleep(delay)
+        # ── Camera coarse/fine state ──────────────────────────────────────────
+        # After any RMB where ma_anchor is detected below screen centre, a
+        # single blind drag (coarse) is performed immediately.  _cam_fine_needed
+        # is then set so that _maybe_fine_align() fires after the next click,
+        # running _rotate_camera_smart(nearest=True) to bring the orientation
+        # within CAMERA_ORIENT_TOL_DEG of the nearest configured angle.
+        _cam_fine_needed: bool = False
 
-        # ---- First click (avoid centre exclusion zone) -------------------------
+        def _coarse_if_below(apos: Optional[Tuple[int, int]]) -> None:
+            """If anchor is in the bottom 33% of the screen → blind 180° drag; arm fine align."""
+            nonlocal _cam_fine_needed
+            threshold = int(fh * 0.67)
+            if apos is not None and apos[1] > threshold:
+                logger.info(
+                    f"[BOT] SA-MA: ma_anchor in bottom 33% ({apos[1]} > {threshold})"
+                    " — coarse camera rotation")
+                self.hid.drag_camera(cfg.SA_CAMERA_ROTATE_DX)
+                _cam_fine_needed = True
+
+        def _maybe_fine_align() -> None:
+            """If a coarse rotation was done, fine-align to the nearest configured angle."""
+            nonlocal _cam_fine_needed
+            if _cam_fine_needed:
+                logger.info("[BOT] SA-MA: fine camera alignment after click")
+                self._rotate_camera_smart(nearest=True)
+                _cam_fine_needed = False
+
+        def _dot_center(f: np.ndarray) -> Optional[Tuple[int, int]]:
+            # Short-circuit: search blue first; skip red when blue is found.
+            dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
+                                      conf=cfg.NC_CONFIDENCE,
+                                      nms_dist=cfg.NC_NMS_DIST)
+            if dots:
+                return dots[0]
+            dots = _sa_find_blue_dots(f, self._dot_red_tmpl,
+                                      conf=cfg.NC_CONFIDENCE,
+                                      nms_dist=cfg.NC_NMS_DIST)
+            return dots[0] if dots else None
+
+        def _dc(pt: Tuple[int, int]) -> float:
+            return math.hypot(pt[0] - sc_x, pt[1] - sc_y)
+
+        # ── Step 1: get ma_pos (RMB target — cached; detect once if not yet set) ──
+        # self._ma_pos is normally populated by _check_buff_and_death() before the
+        # first approach cycle.  If it still isn't set (very first call at session
+        # start before any buff-check ran), detect it now from the already-grabbed
+        # frame.  After this, the cached value is reused everywhere — no repeated
+        # template searches inside the loop.
+        if self._ma_pos is None:
+            self._ma_pos = self._detect_ma_pos(frame)
+        ma_pos = self._ma_pos or self._active.assist_point
+
+        # ── Step 2: initial RMB ────────────────────────────────────────────
+        rmb_target = ma_pos or self._active.assist_point
+        if rmb_target is not None:
+            logger.info(f"[BOT] SA-MA: initial RMB at {rmb_target}")
+            _t0 = time.perf_counter()
+            self.hid.move_and_right_click(rmb_target[0], rmb_target[1], wait_after=0)
+            logger.info(f"[PERF] RMB cmd: {(time.perf_counter()-_t0)*1000:.0f} ms")
+        else:
+            logger.warn("[BOT] SA-MA: no ma_pos and no assist_point — skipping RMB")
+
+        # ── Step 3: overlap — ma_anchor on Capture #1 counts toward the wait ─────
+        # frame is Capture #1, taken just before the RMB.  ma_anchor position is
+        # not changed by an RMB click, so the pre-RMB frame is valid for detection.
+        # The detection time absorbs part of SA_RMB_WAIT_MS; only the remainder
+        # is slept explicitly.  bag_mob_anchor is checked on Capture #2 below —
+        # no second ma_anchor search is performed on that fresh frame.
+        _rmb_t = time.perf_counter()
+        _t0 = time.perf_counter()
+        anchor_pos = self._detect_ma_anchor_pos(frame)
+        logger.info(f"[PERF] ma_anchor match: {(time.perf_counter()-_t0)*1000:.0f} ms")
+        # Coarse camera rotation if anchor is below screen centre.
+        # The drag absorbs part of the remaining wait; no extra verification.
+        _coarse_if_below(anchor_pos)
+        _remaining = max(0.0, cfg.SA_RMB_WAIT_MS / 1000.0
+                         - (time.perf_counter() - _rmb_t))
+        if _remaining > 0:
+            _t0 = time.perf_counter()
+            capslock.interruptible_sleep(_remaining)
+            logger.info(
+                f"[PERF] RMB wait (remaining): {(time.perf_counter()-_t0)*1000:.0f} ms")
         capslock.raise_if_on()
-        for _ in range(50):
-            rx = sc_x + random.randint(-half, half)
-            ry = sc_y + random.randint(-half, half)
-            if abs(rx - sc_x) > ex_hw or abs(ry - sc_y) > ex_hh:
-                break   # outside exclusion zone
-        logger.info(f"[BOT] SA fallback: click 1 at ({rx},{ry})")
-        self.hid.move_and_click(rx, ry)
-        first = (rx, ry)
 
-        # ---- Optional second click (50–100 px from first, within area) ---------
-        if random.random() < 0.5:    # 50 % chance of a second click
-            capslock.raise_if_on()
-            capslock.interruptible_sleep(
-                random.uniform(0, cfg.SA_FALLBACK_CLICK2_GAP_MAX / 1000.0))
-            for _ in range(50):
-                angle = random.uniform(0, 2 * math.pi)
-                dist  = random.uniform(cfg.SA_FALLBACK_CLICK_PROX_MIN,
-                                       cfg.SA_FALLBACK_CLICK_PROX_MAX)
-                cx = int(first[0] + math.cos(angle) * dist)
-                cy = int(first[1] + math.sin(angle) * dist)
-                if abs(cx - sc_x) <= half and abs(cy - sc_y) <= half:
-                    break   # within area
-            logger.info(f"[BOT] SA fallback: click 2 at ({cx},{cy})")
-            self.hid.move_and_click(cx, cy)
+        # ── Step 4: post-wait capture — bag_mob_anchor only (no ma_anchor re-search)
+        _t0 = time.perf_counter()
+        frame  = self._grab()
+        logger.info(f"[PERF] capture: {(time.perf_counter()-_t0)*1000:.0f} ms")
 
-        capslock.raise_if_on()
-        return self._sa_phase3_rmb_f5_loop(frame)
-
-    def _sa_healer_area_then_f5(self, frame: np.ndarray) -> bool:
-        """Phase-3 outer loop: healer-area clicks → _sa_phase3_rmb_f5_loop.
-
-        Each pass:
-          1. Find healer_farm_anchor (rotate camera 180° if not found).
-          2a. Still not found → _sa_center_fallback (centred clicks +
-              _sa_phase3_rmb_f5_loop).
-          2b. Found → 0–SA_HEALER_PRE_DELAY_MAX s delay → 1–3 proximity-
-              constrained clicks in SA_HEALER_CLICK_AREA → SA_HEALER_POST_PAUSE
-              → _sa_phase3_rmb_f5_loop.
-          If _sa_phase3_rmb_f5_loop returns True  → return True (recovery exited
-              via RMB).
-          If _sa_phase3_rmb_f5_loop returns False → grab fresh frame and loop
-              back to step 1 (redo healer-area clicks).
-        """
-        def _find_healer(f):
-            return (self._healer_anchor.find(f)
-                    if self._healer_anchor is not None else None)
-
-        def _healer_bounds(hp: Tuple[int, int], f: np.ndarray):
-            h   = cfg.SA_HEALER_CLICK_AREA
-            hh  = h // 2
-            above = hp[1] < f.shape[0] // 2
-            xn = hp[0] - hh
-            xx = hp[0] + hh
-            if above:
-                # Anchor in upper half → click area entirely below the anchor.
-                # Exclusion zone blocks the strip directly beneath the icon.
-                yn   = hp[1]
-                yx   = hp[1] + h
-                ehw  = cfg.SA_HEALER_EXCL_W // 2
-                ebot = hp[1] + cfg.SA_HEALER_EXCL_H
+        mob_acquired = False
+        self._mob_anchor.invalidate()
+        if self._mob_anchor.find(frame) is not None:
+            self._mob_dead_f.invalidate()
+            if self._mob_dead_f.find(frame, silent=True) is None:
+                mob_acquired = True
+                logger.info("[BOT] SA-MA: mob acquired after initial RMB")
             else:
-                # Anchor in lower half → click area entirely above the anchor.
-                # No exclusion zone needed (clicks never overlap the icon).
-                yn   = hp[1] - h
-                yx   = hp[1]
-                ehw  = 0
-                ebot = hp[1]
-            return xn, xx, yn, yx, ehw, ebot
+                logger.info("[BOT] SA-MA: bag_mob_anchor + mob_dead — Esc")
+                _press(self.hid, "esc")
+        else:
+            logger.info("[BOT] SA-MA: mob_anchor not found after initial RMB — Esc")
+            _press(self.hid, "esc")
 
-        def _pick_healer_pt(xn, xx, yn, yx, ehw, ebot, hp,
-                            prev_pt, require_prox: bool):
-            for _ in range(60):
-                cx = random.randint(xn, xx)
-                cy = random.randint(yn, yx)
-                if abs(cx - hp[0]) <= ehw and hp[1] <= cy <= ebot:
-                    continue
-                if require_prox and prev_pt is not None:
-                    d = math.hypot(cx - prev_pt[0], cy - prev_pt[1])
-                    if not (cfg.SA_HEALER_CLICK_PROX_MIN <= d
-                            <= cfg.SA_HEALER_CLICK_PROX_MAX):
-                        continue
-                return cx, cy
-            return hp
+        # ── Step 4: SKIP distance check — only after mob is confirmed ─────
+        # blue/red dots are not a valid mob indicator until bag_mob_anchor
+        # has been found.  Skip entirely if mob_acquired is still False.
+        if mob_acquired:
+            pair_center = _dot_center(frame)
+            if pair_center is not None:
+                dist_dots = _dc(pair_center)
+                logger.info(f"[BOT] SA-MA: blue/red at {pair_center}, dist={dist_dots:.0f}px")
+                if dist_dots < cfg.SA_APPROACH_SKIP_PX:
+                    logger.info("[BOT] SA-MA: within SA_APPROACH_SKIP_PX — attacking immediately")
+                    self._press_attack()
+                    _maybe_fine_align()
+                    return True
+
+        # ── Step 5: ground-click approach loop ────────────────────────────
+        # Three separate anchors:
+        #   ma_pos      — ma1/ma2 template position; used ONLY for RMB clicks.
+        #   anchor_pos  — ma_anchor.png position; drives ground-click area,
+        #                 close-zone (<SA_MA_CLOSE_PX), and anchor-lost logic.
+        #   pair_center — in_target_blue/red midpoint; used ONLY for
+        #                 SA_APPROACH_SKIP_PX and SA_APPROACH_STOP_PX checks.
+        _in_close_zone     = False
+        _close_do_fallback = False   # rolled once when close zone is entered
+        _click_ts: float = 0.0       # perf_counter() at the moment of last click
+        _reuse_poll_frame = False    # True when poll exited with anchor still valid;
+                                     # outer-loop top skips grab+detect when set
+        # pair_center already measured on the frame being reused, so the outer
+        # loop never repeats the (expensive) blue/red dot search on the same
+        # pixels.  None means "not measured for this frame".
+        _poll_dots: Optional[Tuple[int, int]] = None
+        _poll_dots_valid = False
 
         while True:
             capslock.raise_if_on()
 
-            # Invalidate cache so a fresh detection is performed each pass.
-            if self._healer_anchor is not None:
-                self._healer_anchor.invalidate()
+            # For the 2nd+ ground click the poll loop already confirmed anchor_pos
+            # on a fresh frame — reuse both to save one capture + matchTemplate.
+            # Always grab fresh for the first click or after any anchor-loss.
+            _used_poll_frame = _reuse_poll_frame
+            if _reuse_poll_frame:
+                _reuse_poll_frame = False
+                logger.info("[PERF] capture+match: skipped (reusing poll frame/anchor)")
+            else:
+                _poll_dots_valid = False   # new frame → cached dots are stale
+                _t0    = time.perf_counter()
+                frame  = self._grab()
+                logger.info(f"[PERF] capture: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                _t0    = time.perf_counter()
+                anchor_pos = self._detect_ma_anchor_pos(frame)
+                logger.info(f"[PERF] ma_anchor match: {(time.perf_counter()-_t0)*1000:.0f} ms")
 
-            healer_pos = _find_healer(frame)
-            if healer_pos is None:
+            # Re-detect ma1/ma2 RMB target if it was cleared externally.  This
+            # fires when the viewer switches the MA selection mid-approach (which
+            # sets self._ma_pos = None via set_ma_select) or after anchor-loss
+            # recovery if _check_buff_and_death() failed to find the template.
+            if self._ma_pos is None:
+                _t0 = time.perf_counter()
+                self._ma_pos = self._detect_ma_pos(frame)
                 logger.info(
-                    "[BOT] SA phase-3: healer anchor not found — rotating camera")
-                self._rotate_camera_smart()
+                    f"[PERF] ma{self._ma_select} re-detect (mid-loop):"
+                    f" {(time.perf_counter()-_t0)*1000:.0f} ms"
+                    f" → {'found' if self._ma_pos else 'not found'}")
+                ma_pos = self._ma_pos or self._active.assist_point
+
+            # ── ma_anchor lost ─────────────────────────────────────────────
+            if anchor_pos is None:
+                _reuse_poll_frame = False
+                self._mob_anchor.invalidate()
+                has_mob = self._mob_anchor.find(frame) is not None
+                self._mob_dead_f.invalidate()
+                mob_dead_now = has_mob and (
+                    self._mob_dead_f.find(frame, silent=True) is not None)
+                if has_mob and not mob_dead_now:
+                    logger.info("[BOT] SA-MA: ma_anchor lost, mob_anchor present"
+                                " — attack + rotate + continue")
+                    self._press_attack()
+                else:
+                    logger.info("[BOT] SA-MA: ma_anchor lost — rotate + continue")
+
+                # Invariant: if bag_mob_anchor is now confirmed absent (or dead),
+                # mob_acquired must be reset so RMB attempts resume after recovery.
+                if mob_acquired and (not has_mob or mob_dead_now):
+                    logger.info("[BOT] SA-MA: bag_mob_anchor gone while ma_anchor"
+                                " lost — resetting mob_acquired=False")
+                    mob_acquired = False
+
+                # Reuse the frame the anchor was actually found on: re-grabbing
+                # and re-detecting here only discards a result that is already
+                # ~450 ms old and delays restoring SA_MA_CLOSE_PX further.
+                anchor_pos, frame = self._sa_ma_wait_for_anchor(mob_acquired)
+                _reuse_poll_frame = True
+                _poll_dots_valid  = False
+                continue
+
+            d_anchor = _dc(anchor_pos)
+
+            # Unconditional per-iteration state dump: makes it visible on every
+            # pass whether the bot is holding inside the close zone or is due to
+            # keep approaching, without having to infer it from state changes.
+            _cz = d_anchor < cfg.SA_MA_CLOSE_PX
+            logger.info(
+                f"[BOT] SA-MA poll:"
+                f"  ma_anchor=({anchor_pos[0]},{anchor_pos[1]})"
+                f"  dist_to_center={d_anchor:.0f}"
+                f"  SA_MA_CLOSE_PX={cfg.SA_MA_CLOSE_PX}"
+                f"  close_zone={_cz}"
+                f"  mob_acquired={mob_acquired}"
+                f"  action={'hold_position' if _cz else 'continue_MA_clicking'}"
+            )
+
+            # ── STOP distance check — only after mob is confirmed ─────────
+            if mob_acquired:
+                if _used_poll_frame and _poll_dots_valid:
+                    # Same frame the poll loop already searched — reuse result.
+                    pair_center = _poll_dots
+                    logger.info("[PERF] blue/red dots match: reused (same frame)")
+                else:
+                    _t0 = time.perf_counter()
+                    pair_center = _dot_center(frame)
+                    logger.info(f"[PERF] blue/red dots match:"
+                                f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                _dot_dist_val  = _dc(pair_center) if pair_center is not None else None
+                _dot_will_atk  = (_dot_dist_val is not None
+                                   and _dot_dist_val < cfg.SA_APPROACH_STOP_PX)
+                logger.info(
+                    f"[BOT] SA-MA STOP check (outer):"
+                    f"  dot_pos={pair_center}"
+                    f"  dist_to_center="
+                    f"{'N/A' if _dot_dist_val is None else f'{_dot_dist_val:.0f}'}"
+                    f"  SA_APPROACH_STOP_PX={cfg.SA_APPROACH_STOP_PX}"
+                    f"  attack={_dot_will_atk}"
+                )
+                if _dot_will_atk:
+                    _maybe_fine_align()
+                    self._press_attack()
+                    return True
+
+                # Dots not visible — mob is already acquired, attack immediately.
+                if pair_center is None:
+                    logger.info("[BOT] SA-MA: mob acquired, no dots detected — attacking")
+                    _maybe_fine_align()
+                    self._press_attack()
+                    return True
+
+            # ── Close-zone: ma_anchor within SA_MA_CLOSE_PX ───────────────
+            if d_anchor < cfg.SA_MA_CLOSE_PX:
+                if not _in_close_zone:
+                    _in_close_zone     = True
+                    _close_do_fallback = (random.random() < cfg.SA_MA_FALLBACK_CHANCE)
+                    if _close_do_fallback:
+                        logger.info(f"[BOT] SA-MA: ma_anchor within {cfg.SA_MA_CLOSE_PX}px"
+                                    " — fallback clicks")
+                    else:
+                        logger.info(f"[BOT] SA-MA: ma_anchor within {cfg.SA_MA_CLOSE_PX}px"
+                                    " — polling only")
+
+                if _close_do_fallback:
+                    # Only reachable when SA_MA_FALLBACK_CHANCE > 0: the roll
+                    # above is `random.random() < chance`, and random() is
+                    # always >= 0.0, so a chance of 0 can never win.
+                    _close_do_fallback = False   # only once per close-zone entry
+                    n_fb = random.randint(1, 2)
+                    for fb_i in range(n_fb):
+                        if fb_i > 0:
+                            gap_s = random.uniform(
+                                0, cfg.SA_FALLBACK_CLICK2_GAP_MAX / 1000.0)
+                            capslock.interruptible_sleep(gap_s)
+                        frame, cur_anchor, _fb_pt = self._sa_ma_ground_click(
+                            trigger_reason=f"close-zone-fallback#{fb_i + 1}",
+                            mob_acquired=mob_acquired,
+                            close_zone=True)
+                        # Ground click is "the next click" after any pending
+                        # coarse rotation — fire fine alignment here.
+                        _maybe_fine_align()
+                        if cur_anchor is None:
+                            break
+                        anchor_pos = cur_anchor
+                else:
+                    # Close-zone: ground clicks suppressed.
+                    # While mob not yet acquired → RMB → wait → grab → check.
+                    # Once mob_acquired → just grab and check STOP; no more RMBs.
+                    if not mob_acquired:
+                        # Overlap: run ma_anchor on the current pre-RMB frame so
+                        # the detection time absorbs part of SA_RMB_WAIT_MS.
+                        # A fresh frame is captured afterward only for bag_mob_anchor.
+                        rmb_pt = self._ma_pos or self._active.assist_point
+                        _rmb_t = time.perf_counter()
+                        if rmb_pt is not None:
+                            _t0 = time.perf_counter()
+                            self.hid.move_and_right_click(
+                                rmb_pt[0], rmb_pt[1], wait_after=0)
+                            logger.info(
+                                f"[PERF] RMB cmd: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                        _t0        = time.perf_counter()
+                        cur_anchor = self._detect_ma_anchor_pos(frame)
+                        logger.info(f"[PERF] ma_anchor match (RMB wait overlap):"
+                                    f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                        # This close-zone RMB is "the next click" after any
+                        # previous coarse rotation — run fine alignment now.
+                        # Then check the freshly-detected anchor for a new coarse.
+                        _maybe_fine_align()
+                        _coarse_if_below(cur_anchor)
+                        _remaining = max(0.0, cfg.SA_RMB_WAIT_MS / 1000.0
+                                         - (time.perf_counter() - _rmb_t))
+                        if _remaining > 0:
+                            _t0 = time.perf_counter()
+                            capslock.interruptible_sleep(_remaining)
+                            logger.info(f"[PERF] RMB wait (remaining):"
+                                        f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                        capslock.raise_if_on()
+                        # Post-wait capture: bag_mob_anchor only; no second ma_anchor.
+                        _t0   = time.perf_counter()
+                        frame = self._grab()
+                        logger.info(f"[PERF] capture: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                    else:
+                        # mob_acquired: no RMB, no wait — grab fresh for STOP check.
+                        capslock.raise_if_on()
+                        _t0   = time.perf_counter()
+                        frame = self._grab()
+                        logger.info(f"[PERF] capture: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                        _t0        = time.perf_counter()
+                        cur_anchor = self._detect_ma_anchor_pos(frame)
+                        logger.info(f"[PERF] ma_anchor match:"
+                                    f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                    # Keep anchor_pos fresh so the outer loop can reuse this frame
+                    if cur_anchor is not None:
+                        anchor_pos = cur_anchor
+                        if _dc(cur_anchor) >= cfg.SA_MA_CLOSE_PX:
+                            _in_close_zone = False
+                    else:
+                        anchor_pos = None   # outer loop will handle anchor-lost
+
+                    if not mob_acquired:
+                        self._mob_anchor.invalidate()
+                        if self._mob_anchor.find(frame) is not None:
+                            self._mob_dead_f.invalidate()
+                            if self._mob_dead_f.find(frame, silent=True) is None:
+                                mob_acquired = True
+                                logger.info(
+                                    "[BOT] SA-MA: mob acquired in close-zone poll")
+                                _t0 = time.perf_counter()
+                                pair_center = _dot_center(frame)
+                                logger.info(f"[PERF] blue/red dots match (acq):"
+                                            f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                                # Cache so the next outer-loop iteration can reuse
+                                # without repeating the full-frame search.
+                                _poll_dots, _poll_dots_valid = pair_center, True
+                                _dot_dist_val = (_dc(pair_center)
+                                                 if pair_center is not None else None)
+                                _dot_will_atk = (_dot_dist_val is not None
+                                                 and _dot_dist_val
+                                                 < cfg.SA_APPROACH_STOP_PX)
+                                logger.info(
+                                    f"[BOT] SA-MA STOP check (close-zone acq):"
+                                    f"  dot_pos={pair_center}"
+                                    f"  dist_to_center="
+                                    f"{'N/A' if _dot_dist_val is None else f'{_dot_dist_val:.0f}'}"
+                                    f"  SA_APPROACH_STOP_PX={cfg.SA_APPROACH_STOP_PX}"
+                                    f"  attack={_dot_will_atk}"
+                                )
+                                if _dot_will_atk:
+                                    _maybe_fine_align()
+                                    self._press_attack()
+                                    return True
+                            else:
+                                logger.info("[BOT] SA-MA: close-zone:"
+                                            " bag_mob_anchor + mob_dead — Esc")
+                                _press(self.hid, "esc")
+                        else:
+                            logger.info(
+                                "[BOT] SA-MA: close-zone: mob_anchor not found — Esc")
+                            _press(self.hid, "esc")
+                    else:
+                        # mob_acquired was True — re-verify bag_mob_anchor is
+                        # still present (it can be lost after camera rotations /
+                        # Esc presses in anchor-lost recovery).
+                        self._mob_anchor.invalidate()
+                        if self._mob_anchor.find(frame) is not None:
+                            self._mob_dead_f.invalidate()
+                            if self._mob_dead_f.find(frame, silent=True) is None:
+                                # still targeted — check STOP
+                                _t0 = time.perf_counter()
+                                pair_center = _dot_center(frame)
+                                logger.info(f"[PERF] blue/red dots match:"
+                                            f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                                # Cache for the next outer-loop pass, which reuses
+                                # this exact frame — otherwise its STOP check would
+                                # repeat the same two full-screen searches.
+                                _poll_dots, _poll_dots_valid = pair_center, True
+                                _dot_dist_val = (_dc(pair_center)
+                                                 if pair_center is not None else None)
+                                _dot_will_atk = (_dot_dist_val is not None
+                                                 and _dot_dist_val
+                                                 < cfg.SA_APPROACH_STOP_PX)
+                                logger.info(
+                                    f"[BOT] SA-MA STOP check (close-zone acq=True):"
+                                    f"  dot_pos={pair_center}"
+                                    f"  dist_to_center="
+                                    f"{'N/A' if _dot_dist_val is None else f'{_dot_dist_val:.0f}'}"
+                                    f"  SA_APPROACH_STOP_PX={cfg.SA_APPROACH_STOP_PX}"
+                                    f"  attack={_dot_will_atk}"
+                                )
+                                if _dot_will_atk:
+                                    _maybe_fine_align()
+                                    self._press_attack()
+                                    return True
+                            else:
+                                logger.info("[BOT] SA-MA: close-zone: acquired but"
+                                            " mob_dead — Esc, reset mob_acquired")
+                                _press(self.hid, "esc")
+                                mob_acquired = False
+                        else:
+                            logger.info("[BOT] SA-MA: close-zone: bag_mob_anchor"
+                                        " lost (was acquired) — Esc, reset mob_acquired")
+                            _press(self.hid, "esc")
+                            mob_acquired = False
+
+                    # Reuse this frame and anchor in the next outer-loop iteration
+                    # to avoid a redundant grab+detect after continue.
+                    _reuse_poll_frame = (anchor_pos is not None)
+                continue
+
+            # ── Normal approach: ground click toward ma_anchor ─────────────
+            _in_close_zone = False
+
+            # Once the mob is acquired the character is already attacking.
+            # Do not issue any further ground clicks — just keep polling the
+            # STOP-distance check on the next iteration.
+            if mob_acquired:
                 capslock.raise_if_on()
+                continue
+
+            # ── Request a click ─────────────────────────────────────────────
+            # When the poll loop already detected ma_anchor on a fresh frame
+            # (_used_poll_frame=True), pass that anchor as a hint so
+            # _sa_ma_ground_click can skip its own grab+matchTemplate (~415 ms).
+            if _click_ts:
+                logger.info(f"[PERF] click → next click: {(time.perf_counter()-_click_ts)*1000:.0f} ms")
+
+            _hint = anchor_pos if _used_poll_frame else None
+            frame, fresh_anchor, click_pt = self._sa_ma_ground_click(
+                trigger_reason="approach",
+                mob_acquired=mob_acquired,
+                close_zone=False,
+                hint_anchor=_hint)
+            _click_ts = time.perf_counter()
+
+            if fresh_anchor is None:
+                # ma_anchor vanished at click time — let the outer loop's
+                # anchor-lost handling deal with it on the next iteration.
+                anchor_pos        = None
+                _reuse_poll_frame = False
+                continue
+
+            anchor_pos  = fresh_anchor
+            d_remaining = (math.hypot(click_pt[0] - fresh_anchor[0],
+                                      click_pt[1] - fresh_anchor[1])
+                           if click_pt is not None else 0.0)
+
+            # Ground click is "the next click" after any previous coarse rotation.
+            # Fire fine alignment here; coarse is triggered by RMBs only, not
+            # ground clicks, so no _coarse_if_below call at this point.
+            _maybe_fine_align()
+
+            capslock.raise_if_on()
+
+            # ── Post-click RMB if mob not yet acquired ─────────────────────
+            if not mob_acquired:
+                rmb_pt = self._ma_pos or self._active.assist_point
+                if rmb_pt is not None:
+                    _t0 = time.perf_counter()
+                    self.hid.move_and_right_click(rmb_pt[0], rmb_pt[1], wait_after=0)
+                    logger.info(f"[PERF] RMB cmd: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                # anchor_pos == fresh_anchor: valid position before RMB (RMB does
+                # not move the anchor).  Use it to decide if a coarse rotation is
+                # needed; the drag absorbs part of SA_RMB_WAIT_MS.
+                _coarse_if_below(anchor_pos)
+                _t0 = time.perf_counter()
+                capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                logger.info(f"[PERF] RMB wait: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                capslock.raise_if_on()
+                _t0   = time.perf_counter()
                 frame = self._grab()
-                if self._healer_anchor is not None:
-                    self._healer_anchor.invalidate()
-                healer_pos = _find_healer(frame)
-                if healer_pos is None:
-                    logger.info(
-                        "[BOT] SA phase-3: healer still not found — centre fallback")
-                    result = self._sa_center_fallback(frame)
-                    if result:
-                        return True
-                    # _sa_phase3_rmb_f5_loop already slept SA_HEALER_PRE_DELAY_MAX
-                    frame = self._grab()
-                    continue
+                logger.info(f"[PERF] capture: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is not None:
+                    self._mob_dead_f.invalidate()
+                    if self._mob_dead_f.find(frame, silent=True) is None:
+                        mob_acquired = True
+                        logger.info("[BOT] SA-MA: mob acquired after ground-click RMB")
+                    else:
+                        logger.info("[BOT] SA-MA: bag_mob_anchor + mob_dead — Esc")
+                        _press(self.hid, "esc")
+                else:
+                    logger.info("[BOT] SA-MA: mob_anchor not found after RMB — Esc")
+                    _press(self.hid, "esc")
 
-            # ---- Healer anchor found -------------------------------------------
-            pre_delay = random.uniform(cfg.SA_HEALER_PRE_DELAY_MIN,
-                                       cfg.SA_HEALER_PRE_DELAY_MAX)
-            logger.info(f"[BOT] SA phase-3: healer at {healer_pos},"
-                        f" pre-delay {pre_delay:.1f}s")
-            capslock.interruptible_sleep(pre_delay)
+            # ── Poll loop: wait for lead trigger or timeout ────────────────
+            # Assume anchor will stay valid; cleared inside poll on loss.
+            _reuse_poll_frame = True
+            max_wait_ms  = random.randint(cfg.SA_APPROACH_MAX_WAIT_MIN_MS,
+                                          cfg.SA_APPROACH_MAX_WAIT_MAX_MS)
+            poll_deadline = time.perf_counter() + max_wait_ms / 1000.0
 
-            clicks = random.randint(1, 2)
-            logger.info(f"[BOT] SA phase-3: {clicks} click(s) in"
-                        f" {cfg.SA_HEALER_CLICK_AREA}px area")
-
-            def _do_extra_click(click_n: int, prev_pt: Tuple[int, int],
-                                prev_hp: Tuple[int, int],
-                                prev_frame: np.ndarray,
-                                gap_max_s: float) -> Tuple[int, int]:
-                capslock.interruptible_sleep(random.uniform(0, gap_max_s))
+            while time.perf_counter() < poll_deadline:
+                _t0 = time.perf_counter()
+                capslock.interruptible_sleep(cfg.SA_APPROACH_POLL_MS / 1000.0)
+                logger.info(f"[PERF] poll wait: {(time.perf_counter()-_t0)*1000:.0f} ms")
                 capslock.raise_if_on()
-                f = self._grab()
-                self._healer_anchor.invalidate()
-                hp = _find_healer(f)
-                if hp is None:
-                    hp = prev_hp
-                    f  = prev_frame
-                    logger.info(
-                        f"[BOT] SA phase-3: healer anchor lost before click"
-                        f" {click_n} — reusing previous position")
-                xn, xx, yn, yx, ehw, ebot = _healer_bounds(hp, f)
-                pt = _pick_healer_pt(xn, xx, yn, yx, ehw, ebot,
-                                     hp, prev_pt, require_prox=True)
-                if pt == hp:
-                    logger.info(
-                        f"[BOT] SA phase-3: proximity relaxed for click {click_n}"
-                        " (area too far from previous click)")
-                    pt = _pick_healer_pt(xn, xx, yn, yx, ehw, ebot,
-                                         hp, None, require_prox=False)
-                logger.info(f"[BOT] SA phase-3: click {click_n}/{clicks} at {pt}"
-                            f"  [bounds x:{xn}..{xx} y:{yn}..{yx}]")
-                self.hid.move_and_click(pt[0], pt[1])
-                return pt
+                _t0   = time.perf_counter()
+                frame = self._grab()
+                logger.info(f"[PERF] capture: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                _poll_dots_valid = False   # fresh frame → cached dots are stale
 
-            # Click 1
-            capslock.raise_if_on()
-            xn1, xx1, yn1, yx1, ehw1, ebot1 = _healer_bounds(healer_pos, frame)
-            rx, ry = _pick_healer_pt(xn1, xx1, yn1, yx1, ehw1, ebot1,
-                                     healer_pos, None, require_prox=False)
-            logger.info(f"[BOT] SA phase-3: click 1/{clicks} at ({rx},{ry})"
-                        f"  [bounds x:{xn1}..{xx1} y:{yn1}..{yx1}]")
-            self.hid.move_and_click(rx, ry)
-            prev1 = (rx, ry)
+                # ma_anchor drives lead trigger and close-zone
+                # ma_pos (ma1/ma2) is cached — never re-searched in poll loop
+                _t0        = time.perf_counter()
+                new_anchor = self._detect_ma_anchor_pos(frame)
+                logger.info(f"[PERF] ma_anchor match: {(time.perf_counter()-_t0)*1000:.0f} ms")
+                if new_anchor is None:
+                    logger.info("[BOT] SA-MA: ma_anchor lost in poll — exiting poll")
+                    _reuse_poll_frame = False   # outer loop must re-grab
+                    break
 
-            if clicks >= 2:
-                prev2 = _do_extra_click(2, prev1, healer_pos, frame, gap_max_s=2.0)
-            if clicks >= 3:
-                _do_extra_click(3, prev2, healer_pos, frame, gap_max_s=1.0)
+                anchor_pos = new_anchor
+                d_now = _dc(anchor_pos)
 
-            # Post-pause
-            post_pause = random.uniform(cfg.SA_HEALER_POST_PAUSE_MIN,
-                                        cfg.SA_HEALER_POST_PAUSE_MAX)
-            logger.info(f"[BOT] SA phase-3: post-click pause {post_pause:.1f}s")
-            capslock.interruptible_sleep(post_pause)
+                _cz = d_now < cfg.SA_MA_CLOSE_PX
+                logger.info(
+                    f"[BOT] SA-MA poll:"
+                    f"  ma_anchor=({anchor_pos[0]},{anchor_pos[1]})"
+                    f"  dist_to_center={d_now:.0f}"
+                    f"  SA_MA_CLOSE_PX={cfg.SA_MA_CLOSE_PX}"
+                    f"  close_zone={_cz}"
+                    f"  mob_acquired={mob_acquired}"
+                    f"  action={'hold_position' if _cz else 'continue_MA_clicking'}"
+                )
 
-            capslock.raise_if_on()
-            result = self._sa_phase3_rmb_f5_loop(frame)
-            if result:
-                return True
-            # F5 chain exhausted — grab fresh frame and redo healer clicks
-            frame = self._grab()
+                # STOP check — only after mob is confirmed
+                if mob_acquired:
+                    _t0 = time.perf_counter()
+                    pair_center = _dot_center(frame)
+                    logger.info(f"[PERF] blue/red dots match:"
+                                f" {(time.perf_counter()-_t0)*1000:.0f} ms")
+                    # Cache for the outer loop — it reuses this exact frame.
+                    _poll_dots, _poll_dots_valid = pair_center, True
+                    if pair_center is not None:
+                        dist_dots = _dc(pair_center)
+                        if dist_dots < cfg.SA_APPROACH_STOP_PX:
+                            logger.info(f"[BOT] SA-MA: within SA_APPROACH_STOP_PX"
+                                        f" in poll (dist={dist_dots:.0f}px) — attacking")
+                            _maybe_fine_align()
+                            self._press_attack()
+                            return True
+
+                if d_now < cfg.SA_MA_CLOSE_PX:
+                    logger.info(f"[BOT] SA-MA: entered close zone in poll"
+                                f" (d={d_now:.0f}px) — exiting poll")
+                    break   # anchor still valid → _reuse_poll_frame stays True
+
+                if d_now <= d_remaining + cfg.SA_MA_LEAD_PX:
+                    logger.info(f"[BOT] SA-MA: next-click trigger"
+                                f" (d_now={d_now:.0f}"
+                                f" ≤ d_rem={d_remaining:.0f}"
+                                f" + lead={cfg.SA_MA_LEAD_PX})")
+                    break   # anchor still valid → _reuse_poll_frame stays True
+            else:
+                logger.info(f"[BOT] SA-MA: poll cap ({max_wait_ms} ms) reached"
+                            " — forcing next click")
+                # deadline: anchor was valid on last poll iteration
+            # end poll loop — outer while continues
+
+    # ------------------------------------------------------------------
+    # Ground-click fallback helpers
+    # ------------------------------------------------------------------
+
+    def _sa_pick_fallback_pt(
+            self,
+            sc_x: int, sc_y: int,
+            prev_pt: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[int, int]:
+        """Return a random point in the SA_FALLBACK_CLICK_AREA centred square.
+
+        Excludes a SA_FALLBACK_EXCL_W × SA_FALLBACK_EXCL_H zone directly
+        below the screen centre.  If *prev_pt* is given the new point must
+        be SA_FALLBACK_CLICK_PROX_MIN–MAX px away and still inside the area.
+        """
+        half   = cfg.SA_FALLBACK_CLICK_AREA // 2
+        ex_hw  = cfg.SA_FALLBACK_EXCL_W // 2
+
+        for _ in range(120):
+            rx = random.randint(sc_x - half, sc_x + half)
+            ry = random.randint(sc_y - half, sc_y + half)
+            # exclusion zone: strip directly below screen centre
+            if abs(rx - sc_x) <= ex_hw and sc_y <= ry <= sc_y + cfg.SA_FALLBACK_EXCL_H:
+                continue
+            if prev_pt is not None:
+                d = math.hypot(rx - prev_pt[0], ry - prev_pt[1])
+                if not (cfg.SA_FALLBACK_CLICK_PROX_MIN <= d
+                        <= cfg.SA_FALLBACK_CLICK_PROX_MAX):
+                    continue
+            return rx, ry
+        # rejection sampling exhausted — safe fallback
+        return sc_x, sc_y + half
+
+    def _sa_validated_ground_click(self, cx: int, cy: int,
+                                   source: str = "unknown") -> bool:
+        """Perform a single LMB ground-click at (cx, cy) — "ac" mode only.
+
+        Reserved for the crosshair/corridor assist mode (_single_assist_cycle_ac),
+        which computes its own screen-centred fallback points.  The "a" (MA)
+        path must never call this: it routes every ground LMB through
+        _sa_ma_ground_click(), which accepts no coordinate at all.
+
+        *source* names the mechanic that produced this coordinate so every
+        ground click in the log is attributable.  Always returns True.
+        """
+        self.hid.move_to(cx, cy)
+        self.hid.click_left_hold()
+        logger.info(f"[BOT] SA: ground click at ({cx},{cy})  source={source}")
+        return True
+
+    # The methods _sa_f5_loop, _sa_phase3_rmb_f5_loop, _sa_center_fallback,
+    # and _sa_healer_area_then_f5 have been removed.  Recovery is now handled
+    # entirely by _single_assist_cycle's ground-click fallback loop.
+
+    def _sa_f5_loop_REMOVED(self) -> bool:  # kept as tombstone — not called
+        pass
 
     def _single_assist_cycle(self) -> bool:
-        """Phase-based target search + in_target_blue approach for single-window assist.
+        """Dispatch to the correct assist targeting implementation.
 
-        Normal mode  (self._sa_recovery_mode == False):
-          Phase 1: SA_RMB_ATTEMPTS RMB clicks at assist_point.
-          Phase 2: SA_F5_ATTEMPTS  F5 presses.
-          If all fail → set _sa_recovery_mode = True → healer-area recovery.
-
-        Recovery mode (self._sa_recovery_mode == True):
-          1 RMB click + check.
-          Found  → clear _sa_recovery_mode → phase 4 → return True.
-          Not found → stay in recovery → healer-area recovery.
-
-        Healer-area recovery:
-          pre-delay → proximity clicks in SA_HEALER_CLICK_AREA →
-          post-pause → infinite F5 loop until target found →
-          phase 4 → return True.
-          (if healer anchor not visible: rotate camera 180° → return False)
-
-        Returns True  → target acquired and _press_attack() called.
-        Returns False → no target this iteration; outer loop should retry.
+        "ac" mode (assist_use_crosshair=True):  classic phase-based loop with
+            crosshair calibration → _single_assist_cycle_ac().
+        "a"  mode (assist_use_crosshair=False): ma1/ma2 image-anchor approach
+            → _sa_ma_approach().
         """
-        pt = self._active.assist_point
+        if self._active.assist_use_crosshair:
+            return self._single_assist_cycle_ac()
+        return self._sa_ma_approach()
 
-        if not self._sa_recovery_mode:
-            # ---- Phase 1: SA_RMB_ATTEMPTS RMB clicks ---------------------------
-            # mob_dead visible after an RMB is not treated as a stale-target
-            # condition any more; the attempt is always counted so the phase
-            # advances at a predictable pace.
-            for rmb_i in range(1, cfg.SA_RMB_ATTEMPTS + 1):
-                capslock.raise_if_on()
-                if pt is not None:
-                    self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
-                else:
-                    logger.warn("[BOT] SA: assist_point not set — skipping RMB")
-                capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
-                frame = self._grab()
-                logger.info(
-                    f"[BOT] SA phase-1 RMB #{rmb_i}/{cfg.SA_RMB_ATTEMPTS}")
-                self._mob_anchor.invalidate()
-                if self._mob_anchor.find(frame) is not None:
-                    self._mob_dead_f.invalidate()
-                    if self._mob_dead_f.find(frame, silent=True) is not None:
-                        logger.info("[BOT] SA phase-1: bag_mob_anchor + mob_dead"
-                                    " — dead target, not counting as live")
-                    else:
-                        logger.info("[BOT] SA: bag_mob_anchor found after RMB")
-                        return self._sa_phase4(frame)
+    def _single_assist_cycle_ac(self) -> bool:
+        """Phase-based target search for single-window assist (crosshair / "ac" mode).
 
-            # ---- Phase 2: SA_F5_ATTEMPTS F5 presses ----------------------------
-            for i in range(cfg.SA_F5_ATTEMPTS):
-                capslock.raise_if_on()
-                logger.info(f"[BOT] SA phase-2 F5 #{i + 1}/{cfg.SA_F5_ATTEMPTS}")
-                _press(self.hid, "f5")
-                capslock.interruptible_sleep(cfg.SA_F5_WAIT_MS / 1000.0)
-                frame = self._grab()
-                self._mob_anchor.invalidate()
-                if self._mob_anchor.find(frame) is not None:
-                    self._mob_dead_f.invalidate()
-                    if self._mob_dead_f.find(frame, silent=True) is not None:
-                        logger.info("[BOT] SA phase-2: bag_mob_anchor + mob_dead"
-                                    " — dead target, not counting as live")
-                    else:
-                        logger.info("[BOT] SA: bag_mob_anchor found after F5")
-                        return self._sa_phase4(frame)
+        Linear flow (no outer loop; _cycle() re-calls this for each new mob):
 
-            # All normal attempts exhausted → enter recovery
-            logger.info("[BOT] SA: entering recovery mode")
-            self._sa_recovery_mode = True
-            return self._sa_healer_area_then_f5(frame)
+          Phase 1 — SA_RMB_ATTEMPTS RMB clicks at assist_point.
+                    Esc after every failed attempt.
+                    Found (bag_mob_anchor, no mob_dead) -> phase4 -> return True.
 
-        else:
-            # ---- Recovery mode: single RMB check -------------------------------
+          Phase 2 — ground-click fallback (runs once if Phase 1 fails):
+                    random pre-delay -> optional 1-2 validated ground clicks
+                    (SA_FALLBACK_SKIP_CHANCE chance of skipping entirely).
+
+          Phase 3 — RMB-only recovery loop (after Phase 2, no more ground clicks):
+                    RMB -> wait -> check, repeat until bag_mob_anchor found
+                    (with no mob_dead) -> phase4 -> return True.
+
+        Because this method returns as soon as a mob is acquired and phase4
+        completes, the next call from _cycle() always starts fresh at Phase 1,
+        making the ground-click fallback available again for the next mob.
+        """
+        pt    = self._active.assist_point
+        frame = self._grab()
+        fh, fw = frame.shape[:2]
+        sc_x, sc_y = fw // 2, fh // 2
+
+        # ---- Phase 1: SA_RMB_ATTEMPTS RMB clicks --------------------------------
+        for rmb_i in range(1, cfg.SA_RMB_ATTEMPTS + 1):
             capslock.raise_if_on()
             if pt is not None:
-                logger.info("[BOT] SA recovery: 1 RMB check")
                 self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
             else:
-                logger.warn("[BOT] SA: assist_point not set — skipping recovery RMB")
+                logger.warn("[BOT] SA: assist_point not set -- skipping RMB")
             capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
             frame = self._grab()
+            logger.info(
+                f"[BOT] SA phase-1 RMB #{rmb_i}/{cfg.SA_RMB_ATTEMPTS}")
             self._mob_anchor.invalidate()
             if self._mob_anchor.find(frame) is not None:
-                logger.info("[BOT] SA: target found — exiting recovery mode")
-                self._sa_recovery_mode = False
-                return self._sa_phase4(frame)
+                self._mob_dead_f.invalidate()
+                if self._mob_dead_f.find(frame, silent=True) is not None:
+                    logger.info("[BOT] SA phase-1: bag_mob_anchor + mob_dead"
+                                " -- dead target, not counting as live")
+                else:
+                    logger.info("[BOT] SA: bag_mob_anchor found after RMB")
+                    return self._sa_phase4(frame)
+            capslock.raise_if_on()
+            _press(self.hid, "esc")
 
-            # Still no target — stay in recovery
-            logger.info("[BOT] SA: RMB failed in recovery — continuing healer loop")
-            return self._sa_healer_area_then_f5(frame)
+        # ---- Phase 2: ground-click fallback (runs once) -------------------------
+        capslock.raise_if_on()
+        pre_delay = random.uniform(cfg.SA_FALLBACK_DELAY_MIN,
+                                   cfg.SA_FALLBACK_DELAY_MAX)
+        logger.info(f"[BOT] SA fallback: pre-delay {pre_delay:.1f}s")
+        capslock.interruptible_sleep(pre_delay)
+
+        if random.random() < cfg.SA_FALLBACK_SKIP_CHANCE:
+            logger.info("[BOT] SA fallback: skipping ground clicks this round"
+                        f" ({cfg.SA_FALLBACK_SKIP_CHANCE*100:.0f}% chance roll)")
+        else:
+            n_clicks = random.randint(1, 2)
+            logger.info(f"[BOT] SA fallback: {n_clicks} ground click(s)")
+
+            # Click 1 -- retry until blue glow confirmed
+            capslock.raise_if_on()
+            attempt = 0
+            while True:
+                attempt += 1
+                pt1 = self._sa_pick_fallback_pt(sc_x, sc_y)
+                logger.info(
+                    f"[BOT] SA fallback: click 1 attempt {attempt} at {pt1}")
+                if self._sa_validated_ground_click(pt1[0], pt1[1],
+                                                   source="ac-fallback#1"):
+                    break
+                capslock.raise_if_on()
+
+            # Click 2 (optional) -- retry until confirmed; proximity relative to pt1
+            if n_clicks >= 2:
+                capslock.raise_if_on()
+                gap_s = random.uniform(
+                    0, cfg.SA_FALLBACK_CLICK2_GAP_MAX / 1000.0)
+                capslock.interruptible_sleep(gap_s)
+                attempt = 0
+                while True:
+                    attempt += 1
+                    pt2 = self._sa_pick_fallback_pt(sc_x, sc_y, prev_pt=pt1)
+                    logger.info(
+                        f"[BOT] SA fallback: click 2 attempt {attempt} at {pt2}")
+                    if self._sa_validated_ground_click(pt2[0], pt2[1],
+                                                       source="ac-fallback#2"):
+                        break
+                    capslock.raise_if_on()
+
+        # ---- Phase 3: RMB-only recovery loop ------------------------------------
+        # No more ground clicks — just keep right-clicking until a live target
+        # appears.  The next call to _single_assist_cycle() (for the next mob)
+        # will start fresh at Phase 1, so the ground-click fallback is available
+        # again immediately.
+        logger.info("[BOT] SA: entering RMB-only recovery loop")
+        rmb_n = 0
+        while True:
+            capslock.raise_if_on()
+            rmb_n += 1
+            if pt is not None:
+                self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
+            else:
+                logger.warn(
+                    "[BOT] SA: assist_point not set -- skipping recovery RMB")
+            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            frame = self._grab()
+            logger.info(f"[BOT] SA recovery RMB #{rmb_n}")
+            self._mob_anchor.invalidate()
+            if self._mob_anchor.find(frame) is not None:
+                self._mob_dead_f.invalidate()
+                if self._mob_dead_f.find(frame, silent=True) is not None:
+                    logger.info("[BOT] SA recovery: bag_mob_anchor + mob_dead"
+                                " -- dead target, continuing loop")
+                    _press(self.hid, "esc")
+                    continue
+                logger.info("[BOT] SA: bag_mob_anchor found in recovery loop")
+                return self._sa_phase4(frame)
+            # mob_anchor not found -> clear any accidental selection
+            _press(self.hid, "esc")
 
     def _target_search(self) -> bool:
         """Acquire a target then verify via bag_mob_anchor.
@@ -2290,6 +3403,10 @@ class FarmBot:
                 logger.info(f"[BOT] bag_mob_anchor found at {pos}")
                 return True
 
+            # RMB miss in assist mode: clear any accidental selection before retry.
+            if mode == "assist":
+                _press(self.hid, "esc")
+
             # Assist: give up after max attempts and return to win1
             if mode == "assist" and attempts >= cfg.ASSIST_RMB_MAX_ATTEMPTS:
                 logger.info(
@@ -2322,6 +3439,15 @@ class FarmBot:
         party_pos = self._party_f.find(frame)
         if party_pos is not None:
             self._active.last_party_pos = party_pos
+
+        # Cache ma1/ma2 position — only search when not yet found (startup or after
+        # viewer changes the selection, which clears self._ma_pos via set_ma_select).
+        if (self._active.targeting_mode == "assist"
+                and not self._active.assist_use_crosshair
+                and self._ma_pos is None):
+            new_ma = self._detect_ma_pos(frame)
+            if new_ma is not None:
+                self._ma_pos = new_ma
 
         # Buff check: at least one of the two images must be present
         buff_present = (self._buff_f.find(frame) is not None
@@ -2460,33 +3586,20 @@ class FarmBot:
                 return "stalled"
 
             # Stall check (assist): mob HP stuck at ≥ HP_STALL_PCT for HP_STALL_S seconds.
-            # 0–3 s jitter → LMB burst at assist_point → 5–10 s wait → return "stalled"
-            # so _cycle can reset recovery state and restart from Phase 1.
+            # Assist mode issues no LMB here under any condition — the stall is
+            # resolved purely by returning "stalled" so _cycle restarts targeting.
             if (self._active.targeting_mode == "assist"
                     and not hp_ever_dropped
                     and time.time() > stall_deadline):
-                pt   = self._active.assist_point
                 nick = self._active.title
                 jitter = random.uniform(cfg.HP_STALL_JITTER_MIN, cfg.HP_STALL_JITTER_MAX)
                 logger.info(
                     f"[BOT] [{nick}] Assist HP stall: mob at ≥{cfg.HP_STALL_PCT}%"
-                    f" for {cfg.HP_STALL_S}s — jitter {jitter:.1f}s, then LMB burst"
+                    f" for {cfg.HP_STALL_S}s — jitter {jitter:.1f}s, then restart"
                 )
                 capslock.interruptible_sleep(jitter)
-                if pt is not None:
-                    burst = random.randint(
-                        cfg.ASSIST_RMB_COUNT_MIN, cfg.ASSIST_RMB_COUNT_MAX
-                    )
-                    for i in range(burst):
-                        self.hid.move_and_click(pt[0], pt[1],
-                                                hold_min=40, hold_max=80)
-                        if i < burst - 1:
-                            time.sleep(random.uniform(
-                                cfg.ASSIST_RMB_INTERVAL_MIN_MS / 1000.0,
-                                cfg.ASSIST_RMB_INTERVAL_MAX_MS / 1000.0,
-                            ))
                 wait_s = random.uniform(cfg.SA_STALL_WAIT_MIN, cfg.SA_STALL_WAIT_MAX)
-                logger.info(f"[BOT] [{nick}] Post-burst pause {wait_s:.1f}s")
+                logger.info(f"[BOT] [{nick}] Pre-restart pause {wait_s:.1f}s")
                 capslock.interruptible_sleep(wait_s)
                 return "stalled"
 
