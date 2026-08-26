@@ -114,17 +114,44 @@ DISP_MAX             = 70.0   # px — larger = something other than normal move
 
 MIN_VALID_REGIONS    =  2     # need at least this many passing regions for a reading
 
+# Angular weighting.
+# After collecting valid regions, the component-wise median direction is used
+# as the consensus.  Each region's final weight is:
+#
+#   w = response² × exp(-(dev_deg / ANGULAR_WEIGHT_SIGMA)²)
+#
+# This gives full weight to regions perfectly aligned with the consensus and
+# smoothly penalises outliers — no binary hard cutoff.
+# ANGULAR_FILTER_DEG is kept as a coarse garbage-only cutoff (true outliers
+# from moving entities etc.); set to 180 to disable entirely.
+ANGULAR_WEIGHT_SIGMA = 28.0   # degrees — soft Gaussian weight half-width
+ANGULAR_FILTER_DEG   = 75     # degrees — hard cutoff for true garbage only
+
 # Smoothing
-SMOOTH_ALPHA_MIN     = 0.30   # used when only MIN_VALID_REGIONS pass
-SMOOTH_ALPHA_MAX     = 0.65   # used when all 8 regions pass
+SMOOTH_ALPHA_MIN     = 0.28   # used when only MIN_VALID_REGIONS pass
+SMOOTH_ALPHA_MAX     = 0.55   # used when all 8 regions pass
 STALE_RESET_COUNT    =  5     # resets smoothed angle after N consecutive misses
 
-CORRIDOR_HALF_DEG    = 45.0   # ± corridor half-width (adjustable at runtime)
+CORRIDOR_HALF_DEG    = 45.0   # ± angular corridor half-width (adjustable at runtime)
+
+# Corridor strip geometry shown in the right panel
+CORRIDOR_W           =  80    # px wide in screen space (matches SA_CORRIDOR_W)
+
+# Fixed correction to the corridor origin, expressed as a fraction of the
+# corridor HALF-WIDTH in panel space.  This is scale-independent:
+#   1.0 shifts the centreline by exactly one half-width (moves a click from
+#       the edge of the corridor to its centre).
+#   0.0 disables the correction.
+# Cardinal directions hit exactly; diagonals interpolate smoothly:
+#   Cx =  CORR_FRAC · half_w · cos(θ)
+#   Cy = −CORR_FRAC · half_w · sin²(θ)
+CORR_FRAC            =  -0.3   # fraction of corridor half-width; set to 0 to disable
 
 # Display
-PREVIEW_W  = 640
-COMPASS_SZ = 280
-LIVE_MS    =  16
+PREVIEW_W        = 640   # left panel: game frame with region boxes
+CORRIDOR_PANEL_W = 320   # right panel: game frame with corridor overlay
+COMPASS_SZ       = 280   # kept for _draw_compass (not shown by default)
+LIVE_MS          =  16
 
 
 # ---------------------------------------------------------------------------
@@ -259,29 +286,86 @@ def _compute(gray_a: np.ndarray,
     if n_valid < MIN_VALID_REGIONS:
         return None, n_valid, 0.0, region_data, dbg
 
-    total_w  = sum(v[2] for v in valid_vecs)
-    avg_dx   = sum(v[0] * v[2] for v in valid_vecs) / total_w
-    avg_dy   = sum(v[1] * v[2] for v in valid_vecs) / total_w
-    avg_resp = total_w / n_valid
+    # ── Consensus direction from median ──────────────────────────────────
+    # Component-wise median is immune to < 50 % outliers.
+    med_dx = float(np.median([v[0] for v in valid_vecs]))
+    med_dy = float(np.median([v[1] for v in valid_vecs]))
+    consensus_rad = math.atan2(med_dy, med_dx)
+    hard_thr_rad  = math.radians(ANGULAR_FILTER_DEG)
 
-    # Divergence score: measures expansion vs translation pattern.
-    # dot(region_to_center_unit_vec, drift_vec) > 0 → expansion from center.
-    # We skip the center itself and weight by magnitude so weak regions don't dominate.
+    # ── Annotate entries, compute per-region angular deviation & weight ──
+    # weight = response² × Gaussian(dev_deg, sigma=ANGULAR_WEIGHT_SIGMA)
+    # Hard cutoff at ANGULAR_FILTER_DEG removes true garbage (moving entities).
+    weighted_vecs: list[tuple] = []   # (dx, dy, final_weight, cx, cy, drift_angle_rad)
+    vi = 0
+    for entry in region_data:
+        if entry['status'] != 'ok':
+            entry['ang_dev'] = None
+            continue
+        dx, dy, resp, cx, cy = valid_vecs[vi]; vi += 1
+        vec_rad = math.atan2(dy, dx)
+        dev_rad = abs(math.atan2(math.sin(vec_rad - consensus_rad),
+                                  math.cos(vec_rad - consensus_rad)))
+        dev_deg = math.degrees(dev_rad)
+        entry['ang_dev'] = dev_deg
+
+        if dev_rad > hard_thr_rad:
+            entry['status'] = 'angular'   # orange — hard-rejected outlier
+            continue
+
+        # Soft Gaussian weight (σ = ANGULAR_WEIGHT_SIGMA)
+        gauss = math.exp(-(dev_deg / ANGULAR_WEIGHT_SIGMA) ** 2)
+        final_w = resp ** 2 * gauss
+        entry['final_w'] = final_w
+        weighted_vecs.append((dx, dy, final_w, cx, cy, vec_rad))
+
+    n_inliers = len(weighted_vecs)
+    dbg['outliers'] = n_valid - n_inliers
+
+    # Fallback: restore all if hard cutoff removed too many
+    if n_inliers < MIN_VALID_REGIONS:
+        # Rebuild with just response² weights (no angular discrimination)
+        weighted_vecs = [
+            (v[0], v[1], v[2] ** 2, v[3], v[4], math.atan2(v[1], v[0]))
+            for v in valid_vecs
+        ]
+        for entry in region_data:
+            if entry['status'] == 'angular':
+                entry['status'] = 'ok'
+        n_inliers = len(weighted_vecs)
+
+    total_w = sum(v[2] for v in weighted_vecs)
+
+    # ── Direction-only circular mean (response²×Gaussian weighted) ───────
+    # Averages the drift *angle* of each region rather than the displacement
+    # vector.  This prevents high-magnitude regions (far from vanishing point)
+    # from dominating simply because perspective makes their drift larger.
+    sin_sum = sum(math.sin(v[5]) * v[2] for v in weighted_vecs)
+    cos_sum = sum(math.cos(v[5]) * v[2] for v in weighted_vecs)
+    mean_drift_rad = math.atan2(sin_sum, cos_sum)
+
+    # Expose as a unit drift vector (magnitude 1) so _drift_to_dir works unchanged
+    avg_dx   = math.cos(mean_drift_rad)
+    avg_dy   = math.sin(mean_drift_rad)
+    avg_resp = sum(v[2] ** 0.5 for v in weighted_vecs) / n_inliers  # √w ≈ response
+
+    # ── Divergence score (expansion vs translation) ───────────────────────
     scx = gray_a.shape[1] // 2
     scy = gray_a.shape[0] // 2
     div_dots = []
-    for dx, dy, resp, cx, cy in valid_vecs:
+    for dx, dy, fw, cx, cy, _ in weighted_vecs:
         rcx, rcy = cx - scx, cy - scy
         rlen = math.hypot(rcx, rcy)
         if rlen > 0:
             ux, uy = rcx / rlen, rcy / rlen
-            div_dots.append((dx * ux + dy * uy) * resp)
+            div_dots.append((dx * ux + dy * uy) * fw)
     div_score = sum(div_dots) / total_w if div_dots else 0.0
 
     dbg['div_score'] = div_score
     dbg['avg_resp']  = avg_resp
+    dbg['n_inliers'] = n_inliers
 
-    return (avg_dx, avg_dy), n_valid, avg_resp, region_data, dbg
+    return (avg_dx, avg_dy), n_inliers, avg_resp, region_data, dbg
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +455,102 @@ def _draw_compass(direction: float | None,
     return canvas
 
 
+def _draw_corridor_panel(frame_bgr: np.ndarray,
+                         direction: float | None,
+                         sw: int, sh: int,
+                         corridor_w: float,
+                         n_valid: int,
+                         panel_w: int,
+                         panel_h: int) -> np.ndarray:
+    """
+    Returns a scaled copy of the live game frame with the movement corridor
+    drawn as a semi-transparent green strip from screen centre to the screen
+    edge.  corridor_w is in original screen pixels (e.g. 80).
+    """
+    panel = cv2.resize(frame_bgr, (panel_w, panel_h),
+                       interpolation=cv2.INTER_LINEAR)
+
+    if direction is None or n_valid < MIN_VALID_REGIONS:
+        dim = np.zeros_like(panel)
+        cv2.addWeighted(dim, 0.45, panel, 0.55, 0, panel)
+        cv2.putText(panel, "NO SIGNAL",
+                    (panel_w // 2 - 42, panel_h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (100, 100, 100), 1)
+        return panel
+
+    # Scale factors from screen space → panel space
+    psx = panel_w / sw
+    psy = panel_h / sh
+
+    rad = math.radians(direction)
+
+    # Corridor half-width in panel pixels (used both for the polygon and the
+    # correction magnitude so CORR_FRAC=1.0 = exactly one half-width shift).
+    hw_px = (corridor_w / 2.0) * math.cos(rad) * psx
+    hw_py = (corridor_w / 2.0) * math.sin(rad) * psy
+    half_w_panel = math.hypot(hw_px, hw_py)   # scalar panel-px half-width
+
+    # Fixed correction applied directly in panel pixels.
+    # Cx =  CORR_FRAC · half_w · cos(θ)
+    # Cy = −CORR_FRAC · half_w · sin²(θ)
+    corr_x_p =  CORR_FRAC * half_w_panel * math.cos(rad)
+    corr_y_p = -CORR_FRAC * half_w_panel * (math.sin(rad) ** 2)
+
+    cx_p = panel_w / 2.0 + corr_x_p
+    cy_p = panel_h / 2.0 + corr_y_p
+
+    # Direction unit vector in panel space
+    dir_px = math.sin(rad) * psx
+    dir_py = -math.cos(rad) * psy
+    # hw_px / hw_py already computed above (reused from half_w_panel)
+
+    # Find t where centre ray hits panel edge
+    ts = []
+    if dir_px > 0:  ts.append((panel_w - 1 - cx_p) / dir_px)
+    elif dir_px < 0: ts.append(-cx_p / dir_px)
+    if dir_py > 0:  ts.append((panel_h - 1 - cy_p) / dir_py)
+    elif dir_py < 0: ts.append(-cy_p / dir_py)
+    t_edge = min(t for t in ts if t > 0)
+
+    ex_p = cx_p + t_edge * dir_px
+    ey_p = cy_p + t_edge * dir_py
+
+    # Corridor polygon (quad from centre outward)
+    pts = np.array([
+        [int(cx_p + hw_px), int(cy_p + hw_py)],
+        [int(cx_p - hw_px), int(cy_p - hw_py)],
+        [int(ex_p - hw_px), int(ey_p - hw_py)],
+        [int(ex_p + hw_px), int(ey_p + hw_py)],
+    ], dtype=np.int32)
+
+    # Semi-transparent green fill
+    overlay = panel.copy()
+    cv2.fillConvexPoly(overlay, pts, (0, 200, 0))
+    cv2.addWeighted(overlay, 0.28, panel, 0.72, 0, panel)
+
+    # Hard boundary lines
+    for sign in (+1, -1):
+        p0 = (int(cx_p + sign * hw_px), int(cy_p + sign * hw_py))
+        p1 = (int(ex_p + sign * hw_px), int(ey_p + sign * hw_py))
+        cv2.line(panel, p0, p1, (0, 255, 0), 1)
+
+    # Centre dot
+    cv2.circle(panel, (int(cx_p), int(cy_p)), 4, (0, 255, 0), -1)
+
+    # Direction degree label (bottom-left)
+    cv2.putText(panel, f"{direction:.0f}\u00b0",
+                (6, panel_h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (0, 230, 0), 1)
+
+    # Corridor width label (bottom-right)
+    lbl = f"w={corridor_w:.0f}px"
+    (tw, _), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+    cv2.putText(panel, lbl, (panel_w - tw - 6, panel_h - 7),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 180, 0), 1)
+
+    return panel
+
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
@@ -455,10 +635,11 @@ def _worker(state: _State,
 # ---------------------------------------------------------------------------
 
 _STATUS_COLOR = {
-    'ok':       (0,   200,  60),   # green  — used
-    'disp':     (0,   140, 220),   # blue   — displacement out of range
-    'response': (0,    80, 180),   # dark blue — low response
-    'mask':     (60,   60,  60),   # dark gray  — masked out
+    'ok':       (0,   200,  60),   # green      — inlier, used in average
+    'angular':  (0,   160, 220),   # orange     — outlier by angular filter
+    'disp':     (0,   100, 180),   # blue       — displacement out of range
+    'response': (0,    60, 140),   # dark blue  — below response threshold
+    'mask':     (55,   55,  55),   # dark gray  — masked out
 }
 
 
@@ -477,14 +658,13 @@ def _render(state: _State,
     if frame_bgr is None:
         return None
 
-    # ── Preview ──────────────────────────────────────────────────────────
+    # ── Left panel: game frame with region diagnostic overlays ───────────
     ph = int(PREVIEW_W * sh / sw)
     preview = cv2.resize(frame_bgr, (PREVIEW_W, ph),
                          interpolation=cv2.INTER_LINEAR)
     psx, psy = PREVIEW_W / sw, ph / sh
 
-    # Region boxes and displacement arrows
-    ARROW_SCALE = 6.0   # amplify small drifts for visibility
+    ARROW_SCALE = 6.0
     for reg in region_data:
         x1p = int(reg['x1'] * psx);  y1p = int(reg['y1'] * psy)
         x2p = int(reg['x2'] * psx);  y2p = int(reg['y2'] * psy)
@@ -492,10 +672,13 @@ def _render(state: _State,
         col = _STATUS_COLOR.get(reg['status'], (100, 100, 100))
 
         cv2.rectangle(preview, (x1p, y1p), (x2p, y2p), col, 1)
-        # Region name + response
-        cv2.putText(preview, f"{reg['name']} {reg['response']:.3f}",
-                    (x1p + 3, y1p + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, col, 1)
+        ang_dev = reg.get('ang_dev')
+        if ang_dev is not None:
+            label = f"{reg['name']} r={reg['response']:.3f} d={ang_dev:.0f}\u00b0"
+        else:
+            label = f"{reg['name']} {reg['response']:.3f}"
+        cv2.putText(preview, label, (x1p + 3, y1p + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, col, 1)
 
         if reg['status'] == 'ok':
             adx = int(reg['dx'] * ARROW_SCALE)
@@ -508,37 +691,32 @@ def _render(state: _State,
             else:
                 cv2.circle(preview, (cxp, cyp), 3, (0, 180, 80), -1)
 
-    # Global direction arrow from screen centre
-    pcx, pcy = PREVIEW_W // 2, ph // 2
-    if direction is not None and n_valid >= MIN_VALID_REGIONS:
-        arrow_r = min(PREVIEW_W, ph) // 4
-        rad = math.radians(direction)
-        ax = pcx + int(arrow_r * math.sin(rad))
-        ay = pcy - int(arrow_r * math.cos(rad))
-        for off in (-corridor_half, corridor_half):
-            ra = math.radians(direction + off)
-            cv2.line(preview, (pcx, pcy),
-                     (pcx + int(arrow_r*math.sin(ra)),
-                      pcy - int(arrow_r*math.cos(ra))),
-                     (0, 160, 0), 1)
-        cv2.arrowedLine(preview, (pcx, pcy), (ax, ay),
-                        (0, 240, 0), 3, tipLength=0.22)
-
     # Centre exclusion circle
     cr = int(CENTER_EXCL_R * min(psx, psy))
-    cv2.circle(preview, (pcx, pcy), cr, (50, 50, 0), 1)
+    pcx_l, pcy_l = PREVIEW_W // 2, ph // 2
+    cv2.circle(preview, (pcx_l, pcy_l), cr, (50, 50, 0), 1)
 
-    # ── Compass ──────────────────────────────────────────────────────────
-    compass = _draw_compass(direction, n_valid, confidence, corridor_half)
-    if compass.shape[0] != ph:
-        pad_t = max(0, (ph - COMPASS_SZ) // 2)
-        pad_b = max(0, ph - COMPASS_SZ - pad_t)
-        compass = np.vstack([np.zeros((pad_t, COMPASS_SZ, 3), np.uint8),
-                             compass,
-                             np.zeros((pad_b, COMPASS_SZ, 3), np.uint8)])
-    compass = compass[:ph]
+    # ── Right panel: game frame with corridor strip overlay ───────────────
+    corr_ph = int(CORRIDOR_PANEL_W * sh / sw)
+    corridor_panel = _draw_corridor_panel(
+        frame_bgr, direction, sw, sh,
+        CORRIDOR_W, n_valid,
+        CORRIDOR_PANEL_W, corr_ph
+    )
 
-    row = np.hstack([preview, np.zeros((ph, 10, 3), np.uint8), compass])
+    # Pad/crop right panel to match preview height
+    if corr_ph < ph:
+        pad_t = (ph - corr_ph) // 2
+        pad_b = ph - corr_ph - pad_t
+        corridor_panel = np.vstack([
+            np.zeros((pad_t, CORRIDOR_PANEL_W, 3), np.uint8),
+            corridor_panel,
+            np.zeros((pad_b, CORRIDOR_PANEL_W, 3), np.uint8),
+        ])
+    else:
+        corridor_panel = corridor_panel[:ph]
+
+    row = np.hstack([preview, np.zeros((ph, 10, 3), np.uint8), corridor_panel])
 
     # ── Status bar ───────────────────────────────────────────────────────
     bar = np.zeros((26, row.shape[1], 3), np.uint8)
@@ -635,6 +813,8 @@ def run_live(monitor_idx: int, interval_ms: float) -> None:
                     f"\r  total={dbg.get('total',0)}  "
                     f"skip(mask={skipped[0]} resp={skipped[1]} disp={skipped[2]})  "
                     f"valid={dbg.get('valid',0)}  "
+                    f"outliers={dbg.get('outliers',0)}  "
+                    f"inliers={dbg.get('n_inliers',0)}  "
                     f"best_resp={dbg.get('best_response',0):.4f}  "
                     f"div={dbg.get('div_score',0):+.2f}  "
                     f"dir={f'{d:.0f}°' if d is not None and nv >= MIN_VALID_REGIONS else '---':>6s}   ",

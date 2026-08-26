@@ -37,6 +37,7 @@ import mss as _mss_mod
 import config as cfg
 import capslock
 import logger
+import movement_dir2 as _md2   # phaseCorrelate direction detection for corridor approach
 from arduino_hid import ArduinoHID, find_arduino_port, rsleep
 from notifier import Notifier
 from window_manager import (find_windows, get_window, activate, minimize,
@@ -939,7 +940,9 @@ class FarmBot:
 
         self._ma1_tmpl: Optional[np.ndarray] = _load_ma("ma1.png")
         self._ma2_tmpl: Optional[np.ndarray] = _load_ma("ma2.png")
-        self._ma_anchor_tmpl: Optional[np.ndarray] = _load_ma("ma_anchor.png")
+        # ma_anchor.png disabled — movement now driven by phaseCorrelate corridor approach.
+        # self._ma_anchor_tmpl: Optional[np.ndarray] = _load_ma("ma_anchor.png")
+        self._ma_anchor_tmpl = None
         self._ma_select: int = 1                          # 1 or 2; toggled by viewer
         self._ma_pos: Optional[Tuple[int, int]] = None   # cached RMB point (ma1/ma2)
 
@@ -3150,17 +3153,373 @@ class FarmBot:
     def _sa_f5_loop_REMOVED(self) -> bool:  # kept as tombstone — not called
         pass
 
+    # ------------------------------------------------------------------
+    # Corridor approach — phaseCorrelate direction detection (replaces
+    # the ma_anchor / ma1 / ma2 image-based approach)
+    # ------------------------------------------------------------------
+
+    def _detect_movement_dir(self) -> Optional[float]:
+        """Single phaseCorrelate measurement → movement direction in degrees.
+
+        Grabs two frames SA_DIR_INTERVAL_MS apart, converts to gray, and runs
+        the multi-region phaseCorrelate pipeline from movement_dir2.
+        Returns 0–360° (0 = up / north, 90 = right / east) or None when the
+        signal is too weak.
+
+        Region layout and mask are built lazily on first call and cached
+        per screen resolution.
+        """
+        frame_a = self._grab()
+        fh, fw  = frame_a.shape[:2]
+
+        if (not hasattr(self, '_dir_regions')
+                or getattr(self, '_dir_fw', 0) != fw
+                or getattr(self, '_dir_fh', 0) != fh):
+            mask = _md2._build_mask(fw, fh)
+            self._dir_regions = _md2._build_regions(fw, fh, mask)
+            self._dir_fw, self._dir_fh = fw, fh
+            logger.info(f"[BOT] Dir regions built for {fw}×{fh}"
+                        f" ({len(self._dir_regions)} regions)")
+
+        gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        capslock.interruptible_sleep(cfg.SA_DIR_INTERVAL_MS / 1000.0)
+        capslock.raise_if_on()
+
+        frame_b = self._grab()
+        gray_b  = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        drift, n_valid, conf, _, _ = _md2._compute(gray_a, gray_b,
+                                                    self._dir_regions)
+        if drift is None or n_valid < _md2.MIN_VALID_REGIONS:
+            logger.info(f"[BOT] Dir detect: no signal (n_valid={n_valid})")
+            return None
+
+        direction = _md2._drift_to_dir(*drift)
+        logger.info(f"[BOT] Dir detect: {direction:.1f}°"
+                    f" (n_valid={n_valid}, conf={conf:.3f})")
+        return direction
+
+    def _sa_corridor_approach(self) -> bool:
+        """Corridor-based approach using phaseCorrelate direction detection.
+
+        Replaces _sa_ma_approach().  Uses assist_point for all RMB clicks.
+        No ma_anchor, ma1, or ma2 image searches are performed.
+
+        Phase 1 — RMB + Esc loop (SA_RMB_WAIT_MS per attempt) until
+                  mob_anchor is found without mob_dead.
+        Phase 2 — Pre-attack delay → ASSIST_ATTACK_COUNT_MIN presses.
+                  Blue-dot check:
+                    < SA_APPROACH_SKIP_PX  → attack + return (no ground clicks).
+                    otherwise              → run 0–SA_DIR_CHECKS_MAX direction
+                                            checks, then corridor click loop.
+        Corridor loop — same distance-driven timing as _sa_phase4:
+                  next click fires when d_now ≤ d_remaining + SA_NEXT_CLICK_LEAD_PX.
+                  When blue dots are not visible, direction from phaseCorrelate is
+                  used to construct a virtual target point.
+        SA_EXCL_ROIS_FHD — applied to every corridor click (push 2 px past edge)
+                           and to every blue/red dot detection (result-map mask).
+        """
+        fw   = fh = sc_x = sc_y = 0
+
+        def _rmb_pt() -> Optional[Tuple[int, int]]:
+            """Current RMB target: ma1/ma2 detected position, fallback assist_point.
+            Always read fresh — set_ma_select() may clear self._ma_pos mid-loop."""
+            return self._ma_pos or self._active.assist_point
+
+        def _setup(f: np.ndarray) -> None:
+            nonlocal fw, fh, sc_x, sc_y
+            fh, fw = f.shape[:2]
+            sc_x, sc_y = fw // 2, fh // 2
+
+        def _dot_center(f: np.ndarray) -> Optional[Tuple[int, int]]:
+            dots  = _sa_find_blue_dots(f, self._dot_blue_tmpl,
+                                       conf=cfg.NC_CONFIDENCE,
+                                       nms_dist=cfg.NC_NMS_DIST)
+            dots += _sa_find_blue_dots(f, self._dot_red_tmpl,
+                                       conf=cfg.NC_CONFIDENCE,
+                                       nms_dist=cfg.NC_NMS_DIST)
+            if len(dots) > 1:
+                dots.sort(key=lambda p: p[0])
+                dots = _sa_nms(dots, cfg.NC_NMS_DIST)
+            return _sa_blue_pair_center(dots)
+
+        def _dc(pt2: Tuple[int, int]) -> float:
+            return math.hypot(pt2[0] - sc_x, pt2[1] - sc_y)
+
+        # ── Phase 1: RMB + Esc loop ──────────────────────────────────────────
+        frame = self._grab()
+        _setup(frame)
+        # Ensure ma1/ma2 RMB target is cached before the first click.
+        if self._ma_pos is None:
+            self._ma_pos = self._detect_ma_pos(frame)
+        rmb_n = 0
+        while True:
+            capslock.raise_if_on()
+            rmb_n += 1
+            rmb = _rmb_pt()
+            # Re-detect if set_ma_select() cleared the cache mid-loop.
+            if rmb is None and self._ma_pos is None:
+                self._ma_pos = self._detect_ma_pos(frame)
+                rmb = _rmb_pt()
+            if rmb is not None:
+                logger.info(f"[BOT] SA-COR RMB #{rmb_n} at {rmb}")
+                self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
+            else:
+                logger.warn("[BOT] SA-COR: no RMB target — skipping RMB")
+            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            capslock.raise_if_on()
+            frame = self._grab()
+            self._mob_anchor.invalidate()
+            if self._mob_anchor.find(frame) is not None:
+                self._mob_dead_f.invalidate()
+                if self._mob_dead_f.find(frame, silent=True) is None:
+                    logger.info(f"[BOT] SA-COR: mob_anchor found (RMB #{rmb_n})")
+                    break
+                logger.info("[BOT] SA-COR: mob_anchor + mob_dead — Esc")
+            else:
+                logger.info("[BOT] SA-COR: mob_anchor not found — Esc")
+            _press(self.hid, "esc")
+
+        # ── Phase 2: Mob acquired ────────────────────────────────────────────
+        if random.random() < cfg.SA_PRE_ATTACK_LONG_CHANCE:
+            pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_LONG_MIN,
+                                       cfg.SA_PRE_ATTACK_DELAY_LONG_MAX)
+            logger.info(f"[BOT] SA-COR: long pre-attack delay {pre_delay:.2f}s")
+        else:
+            pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_MIN,
+                                       cfg.SA_PRE_ATTACK_DELAY_MAX)
+            logger.info(f"[BOT] SA-COR: pre-attack delay {pre_delay:.2f}s")
+        if pre_delay > 0:
+            capslock.interruptible_sleep(pre_delay)
+        capslock.raise_if_on()
+
+        logger.info("[BOT] SA-COR: mob confirmed — immediate attack")
+        self._press_attack()
+        capslock.raise_if_on()
+
+        frame = self._grab()
+        _setup(frame)
+        pair_center = _dot_center(frame)
+
+        if pair_center is not None:
+            d = _dc(pair_center)
+            logger.info(f"[BOT] SA-COR: blue/red at {pair_center}, dist={d:.0f}px")
+            if d < cfg.SA_APPROACH_SKIP_PX:
+                logger.info("[BOT] SA-COR: within SA_APPROACH_SKIP_PX"
+                            " — attacking, no ground clicks")
+                self._press_attack()
+                return True
+        else:
+            logger.info("[BOT] SA-COR: blue/red not visible after mob confirmed")
+
+        # ── Direction detection (0–SA_DIR_CHECKS_MAX checks) ────────────────
+        n_dir = random.randint(0, cfg.SA_DIR_CHECKS_MAX)
+        direction: Optional[float] = None
+        logger.info(f"[BOT] SA-COR: {n_dir} direction check(s)")
+        for i in range(n_dir):
+            capslock.raise_if_on()
+            d_val = self._detect_movement_dir()
+            if d_val is not None:
+                direction = d_val
+                logger.info(f"[BOT] SA-COR: dir {i+1}/{n_dir} → {d_val:.1f}°")
+            else:
+                logger.info(f"[BOT] SA-COR: dir {i+1}/{n_dir} → no signal")
+
+        # ── Corridor click approach ──────────────────────────────────────────
+        poll_s   = cfg.SA_APPROACH_POLL_MS / 1000.0
+        n_clicks = random.randint(cfg.SA_APPROACH_MIN_DCLK,
+                                  cfg.SA_APPROACH_MAX_DCLK)
+        logger.info(f"[BOT] SA-COR: approach budget = {n_clicks} click(s)")
+        reached = False
+
+        excl: list = (list(getattr(cfg, "SA_EXCL_ROIS_FHD", []))
+                      if fw == 1920 and fh == 1080 else [])
+
+        def _make_target(
+                dots: Optional[Tuple[int, int]],
+                dir_deg: Optional[float],
+        ) -> Optional[Tuple[int, int]]:
+            """Virtual target (tx, ty) for _sa_corridor_point."""
+            if dots is not None:
+                raw_dx  = dots[0] - sc_x
+                raw_dy  = dots[1] - sc_y
+                raw_len = math.hypot(raw_dx, raw_dy) or 1.0
+                h_fac   = abs(raw_dx) / raw_len
+                down_px = int(h_fac * cfg.SA_APPROACH_DOWN_OFFSET_MAX)
+                return dots[0], dots[1] + down_px
+            if dir_deg is not None:
+                rad  = math.radians(dir_deg)
+                tdist = max(cfg.SA_FIRST_CLICK_MIN_PX * 3,
+                            int(min(fw, fh) * 0.35))
+                # SA_DIR_CORR_FRAC correction — same formula as movement_dir2.py
+                cx_ = cfg.SA_DIR_CORR_FRAC * (cfg.SA_CORRIDOR_W / 2) * math.cos(rad)
+                cy_ = (-cfg.SA_DIR_CORR_FRAC * (cfg.SA_CORRIDOR_W / 2)
+                       * (math.sin(rad) ** 2))
+                return (int(sc_x + math.sin(rad) * tdist + cx_),
+                        int(sc_y - math.cos(rad) * tdist + cy_))
+            return None
+
+        for dclk_i in range(n_clicks):
+            capslock.raise_if_on()
+
+            if dclk_i > 0:
+                frame = self._grab()
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is None:
+                    logger.info(f"[BOT] SA-COR: mob_anchor lost at click"
+                                f" #{dclk_i+1} — RMB reacquire + attack")
+                    rmb = _rmb_pt()
+                    if rmb is not None:
+                        self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
+                        capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                    else:
+                        logger.warn("[BOT] SA-COR: no RMB target for reacquire")
+                    self._press_attack()
+                    return True
+                pair_center = _dot_center(frame)
+
+            if pair_center is not None:
+                d = _dc(pair_center)
+                if d < cfg.SA_APPROACH_STOP_PX:
+                    logger.info(f"[BOT] SA-COR: within SA_APPROACH_STOP_PX before"
+                                f" click #{dclk_i+1} (dist={d:.0f}px)")
+                    reached = True
+                    break
+
+            # If dots absent and no direction yet, take one measurement now.
+            if pair_center is None and direction is None:
+                logger.info(f"[BOT] SA-COR: no dots+no dir at click"
+                            f" #{dclk_i+1} — direction check")
+                direction = self._detect_movement_dir()
+
+            target = _make_target(pair_center, direction)
+            if target is None:
+                logger.info(f"[BOT] SA-COR: no target at click #{dclk_i+1} — attacking")
+                self._press_attack()
+                return True
+
+            min_dist  = (cfg.SA_FIRST_CLICK_MIN_PX if dclk_i == 0
+                         else cfg.SA_NEXT_CLICK_MIN_PX)
+            click_pt  = _sa_corridor_point(sc_x, sc_y, target[0], target[1],
+                                           cfg.SA_CORRIDOR_W // 2,
+                                           min_dist_px=min_dist)
+            if excl:
+                click_pt = _push_outside_excl(click_pt[0], click_pt[1], excl)
+
+            d_remaining = math.hypot(click_pt[0] - target[0],
+                                     click_pt[1] - target[1])
+            logger.info(
+                f"[BOT] SA-COR: click #{dclk_i+1} at {click_pt},"
+                f" d_remaining={d_remaining:.0f}px"
+                + (f", dir={direction:.1f}°"
+                   if pair_center is None and direction is not None else "")
+            )
+            self.hid.double_click_at(click_pt[0], click_pt[1])
+
+            # Poll until arrival or mob lost.
+            max_wait_ms    = random.randint(cfg.SA_APPROACH_MAX_WAIT_MIN_MS,
+                                            cfg.SA_APPROACH_MAX_WAIT_MAX_MS)
+            click_deadline = time.perf_counter() + max_wait_ms / 1000.0
+
+            while time.perf_counter() < click_deadline:
+                capslock.interruptible_sleep(poll_s)
+                capslock.raise_if_on()
+
+                frame = self._grab()
+                self._mob_anchor.invalidate()
+                if self._mob_anchor.find(frame) is None:
+                    logger.info(f"[BOT] SA-COR: mob_anchor lost after click"
+                                f" #{dclk_i+1} — RMB + attack")
+                    rmb = _rmb_pt()
+                    if rmb is not None:
+                        self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
+                        capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+                    else:
+                        logger.warn("[BOT] SA-COR: no RMB target for reacquire")
+                    self._press_attack()
+                    return True
+
+                pc = _dot_center(frame)
+                if pc is not None:
+                    d_now = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
+                    if d_now < cfg.SA_APPROACH_STOP_PX:
+                        logger.info(
+                            f"[BOT] SA-COR: within SA_APPROACH_STOP_PX after"
+                            f" click #{dclk_i+1} (dist={d_now:.0f}px)")
+                        reached      = True
+                        pair_center  = pc
+                        break
+                    if d_now <= d_remaining + cfg.SA_NEXT_CLICK_LEAD_PX:
+                        logger.info(
+                            f"[BOT] SA-COR: next-click trigger after"
+                            f" #{dclk_i+1} (d_now={d_now:.0f}"
+                            f" ≤ d_rem={d_remaining:.0f}"
+                            f" + lead={cfg.SA_NEXT_CLICK_LEAD_PX})")
+                        pair_center = pc
+                        break
+            else:
+                logger.info(f"[BOT] SA-COR: max wait reached after click"
+                            f" #{dclk_i+1} — proceeding")
+
+            if reached:
+                break
+
+        # ── Final fallback ───────────────────────────────────────────────────
+        if not reached:
+            frame    = self._grab()
+            pc_final = _dot_center(frame)
+            if pc_final is not None:
+                half  = cfg.SA_APPROACH_FINAL_AREA // 2
+                ex_hw = cfg.SA_APPROACH_FINAL_EXCL_W // 2
+                px, py = pc_final
+                for _ in range(60):
+                    fx = random.randint(px - half, px + half)
+                    fy = random.randint(py, py + cfg.SA_APPROACH_FINAL_AREA)
+                    if (abs(fx - px) <= ex_hw
+                            and fy <= py + cfg.SA_APPROACH_FINAL_EXCL_H):
+                        continue
+                    if excl:
+                        fx, fy = _push_outside_excl(fx, fy, excl)
+                    break
+                else:
+                    fx, fy = px, py + half
+                logger.info(f"[BOT] SA-COR: final fallback click at ({fx},{fy})")
+                self.hid.double_click_at(fx, fy)
+
+                wait_s         = random.uniform(
+                    cfg.SA_APPROACH_FINAL_WAIT_MIN_MS / 1000.0,
+                    cfg.SA_APPROACH_FINAL_WAIT_MAX_MS / 1000.0)
+                final_deadline = time.perf_counter() + wait_s
+                while time.perf_counter() < final_deadline:
+                    capslock.interruptible_sleep(poll_s)
+                    capslock.raise_if_on()
+                    frame = self._grab()
+                    pc = _dot_center(frame)
+                    if pc is not None:
+                        d = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
+                        if d < cfg.SA_APPROACH_STOP_PX:
+                            logger.info("[BOT] SA-COR: within SA_APPROACH_STOP_PX"
+                                        " during final wait")
+                            break
+                else:
+                    logger.info("[BOT] SA-COR: final wait elapsed — attacking anyway")
+            else:
+                logger.info("[BOT] SA-COR: dots lost before final fallback — attacking")
+
+        self._press_attack()
+        return True
+
     def _single_assist_cycle(self) -> bool:
         """Dispatch to the correct assist targeting implementation.
 
         "ac" mode (assist_use_crosshair=True):  classic phase-based loop with
             crosshair calibration → _single_assist_cycle_ac().
-        "a"  mode (assist_use_crosshair=False): ma1/ma2 image-anchor approach
-            → _sa_ma_approach().
+        "a"  mode (assist_use_crosshair=False): phaseCorrelate corridor approach
+            → _sa_corridor_approach().
         """
         if self._active.assist_use_crosshair:
             return self._single_assist_cycle_ac()
-        return self._sa_ma_approach()
+        return self._sa_corridor_approach()
 
     def _single_assist_cycle_ac(self) -> bool:
         """Phase-based target search for single-window assist (crosshair / "ac" mode).
@@ -3440,7 +3799,7 @@ class FarmBot:
         if party_pos is not None:
             self._active.last_party_pos = party_pos
 
-        # Cache ma1/ma2 position — only search when not yet found (startup or after
+        # Cache ma1/ma2 RMB target — only search when not yet found (startup or after
         # viewer changes the selection, which clears self._ma_pos via set_ma_select).
         if (self._active.targeting_mode == "assist"
                 and not self._active.assist_use_crosshair

@@ -371,6 +371,22 @@ SA_APPROACH_FINAL_EXCL_H      =  40  # exclusion zone height below dot centre
 SA_APPROACH_FINAL_WAIT_MIN_MS = 3000 # min wait after final click (ms)
 SA_APPROACH_FINAL_WAIT_MAX_MS = 5000 # max wait after final click (ms)
 
+# --- SA corridor approach — phaseCorrelate direction detection ---
+# SA_DIR_INTERVAL_MS: gap between frame A and B fed to cv2.phaseCorrelate.
+#   80 ms is the minimum that gives a detectable pixel shift at normal running
+#   speed; reduce to 50 ms for faster detection at the cost of signal quality.
+SA_DIR_INTERVAL_MS  =  80    # ms between the two frames
+# SA_DIR_CORR_FRAC: corridor-origin correction expressed as a fraction of the
+#   corridor half-width (SA_CORRIDOR_W / 2).
+#   Cx =  CORR_FRAC · (W/2) · cos(θ)
+#   Cy = −CORR_FRAC · (W/2) · sin²(θ)
+#   Tuned with movement_dir2.py: -0.3 centred ground clicks for this camera.
+SA_DIR_CORR_FRAC    = -0.3   # fraction of corridor half-width
+# SA_DIR_CHECKS_MAX: random number of phaseCorrelate checks (0…N) run before
+#   the very first corridor click to establish movement direction.
+#   Each check costs ≈SA_DIR_INTERVAL_MS + ~50 ms capture/compute.
+SA_DIR_CHECKS_MAX   =   6    # max checks (actual count drawn uniformly from 0..N)
+
 # ---------------------------------------------------------------------------
 # NextTarget
 # ---------------------------------------------------------------------------
