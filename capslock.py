@@ -31,11 +31,40 @@ _PAUSE_VK = _VK_SCROLLLOCK   # default; overridden by set_pause_key()
 # automatically without any further changes to the bot's code.
 _viewer_manual: "threading.Event | None" = None
 
+# Optional viewer fps-lock event.  When set, the tile is [MAX]-locked in the
+# Viewer (middle-click); the bot pauses exactly like CapsLock.  Independent of
+# _viewer_manual so that un-hovering a tile does not accidentally un-pause a
+# MAX-locked bot.
+_viewer_fps_lock: "threading.Event | None" = None
+
+# When True, raise_if_on() / interruptible_sleep() are no-ops.
+# Used by "LastHit Only" mode so that this process's bot ignores the pause key
+# while still suppressing ground clicks internally.
+_bypass: bool = False
+
 
 def register_viewer_manual(event: threading.Event) -> None:
     """Register the Event used by the sender to signal viewer manual focus."""
     global _viewer_manual
     _viewer_manual = event
+
+
+def register_viewer_fps_lock(event: threading.Event) -> None:
+    """Register the Event used by the sender to signal [MAX] fps-lock pause."""
+    global _viewer_fps_lock
+    _viewer_fps_lock = event
+
+
+def set_bypass(enabled: bool) -> None:
+    """Enable or disable the pause-key bypass for this process.
+
+    When True, raise_if_on() and interruptible_sleep() become no-ops so the
+    bot keeps running even while the pause key is toggled on.  Used by
+    "LastHit Only" mode so that selected bots ignore CapsLock while the rest
+    remain fully paused.
+    """
+    global _bypass
+    _bypass = bool(enabled)
 
 
 def set_pause_key(key_name: str) -> None:
@@ -66,11 +95,14 @@ def _key_on() -> bool:
 
 
 def is_on() -> bool:
-    """Return True if the pause key is toggled on OR the viewer has manual focus."""
+    """Return True if paused for any reason: pause key, viewer focus, or MAX lock."""
     if _key_on():
         return True
     vm = _viewer_manual
-    return vm is not None and vm.is_set()
+    if vm is not None and vm.is_set():
+        return True
+    fl = _viewer_fps_lock
+    return fl is not None and fl.is_set()
 
 
 def pause_reason() -> str:
@@ -78,6 +110,7 @@ def pause_reason() -> str:
 
     'key'    – hardware pause key (CapsLock / ScrollLock) is toggled on
     'viewer' – the viewer has manual focus on this tile
+    'max'    – the tile is [MAX]-locked in the Viewer (middle-click)
     ''       – not paused
     """
     if _key_on():
@@ -85,27 +118,53 @@ def pause_reason() -> str:
     vm = _viewer_manual
     if vm is not None and vm.is_set():
         return "viewer"
+    fl = _viewer_fps_lock
+    if fl is not None and fl.is_set():
+        return "max"
     return ""
 
 
 def raise_if_on():
-    """Raise CapsLockPause if paused (pause key or viewer manual focus)."""
+    """Raise CapsLockPause if paused (pause key or viewer manual focus).
+
+    No-op when the bypass is active (e.g. "LastHit Only" mode).
+    """
+    if _bypass:
+        return
     if is_on():
         raise CapsLockPause()
 
 
-def wait_off():
-    """Block the calling thread until both the pause key is released and the
-    viewer manual-focus event is cleared.  Logs on entry and exit.  No-op if
-    already unpaused.
+def raise_if_lasthit_paused(hp_only: bool) -> None:
+    """Raise CapsLockPause when the bot should yield to LastHit-Only mode.
+
+    Unlike raise_if_on(), this fires even while the bypass is active — it is
+    intended for targeting / approach loops that must hand control back to
+    _lastHit_only_cycle() when the pause key is toggled on mid-flow.
+
+    Call pattern (in every while-True iteration of a long-running loop):
+        capslock.raise_if_on()                   # normal pause path
+        capslock.raise_if_lasthit_paused(self._hp_only)  # LastHit-Only path
     """
-    if not is_on():
+    if hp_only and is_on():
+        raise CapsLockPause()
+
+
+def wait_off():
+    """Block until all pause sources are cleared: pause key, viewer focus, MAX lock.
+
+    Logs on entry and exit.  No-op if already unpaused or if the bypass is active.
+    """
+    if _bypass or not is_on():
         return
-    if _key_on():
+    reason = pause_reason()
+    if reason == "key":
         info("CapsLock - waiting for release...")
+    elif reason == "max":
+        info("Viewer [MAX] lock — bot paused, waiting for unlock...")
     else:
         info("Viewer focus — bot paused, waiting for viewer to release...")
-    while is_on():
+    while is_on() and not _bypass:
         time.sleep(0.2)
     info("Resumed")
 

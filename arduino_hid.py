@@ -109,25 +109,41 @@ class ArduinoHID:
         return 0
 
     # ---- movement ------------------------------------------------------------
+    _MOVE_TOLERANCE   = 2   # px; within this distance counts as arrived
+    _MOVE_CORRECTIONS = 3   # extra correction passes after the first move
+
     def move_to(self, x, y):
         """Move cursor to absolute (x, y) via a relative Arduino move.
 
-        pyautogui.position() is a READ of the OS cursor position, not injection.
+        Waits for the firmware's 'OK' reply after each MOVE command so the OS
+        cursor position is stable before the next check or click.  Falls back
+        to up to _MOVE_CORRECTIONS extra passes if the first move undershoots.
         """
         if self._ser is None:
             logger.warn("[ARDUINO] not connected - move skipped")
             return False
+        for _ in range(1 + self._MOVE_CORRECTIONS):
+            try:
+                cur_x, cur_y = _pag.position()
+            except Exception:
+                cur_x, cur_y = 0, 0
+            dx = int(x - cur_x)
+            dy = int(y - cur_y)
+            if abs(dx) <= self._MOVE_TOLERANCE and abs(dy) <= self._MOVE_TOLERANCE:
+                return True
+            self._send(f"MOVE,{dx},{dy}")
+            try:
+                self._ser.readline()   # blocks until firmware replies "OK\n"
+            except Exception:
+                pass
+            time.sleep(0.008)  # allow last USB HID frame to reach the OS
         try:
-            cur_x, cur_y = _pag.position()
+            fx, fy = _pag.position()
+            if (abs(int(x) - fx) > self._MOVE_TOLERANCE or
+                    abs(int(y) - fy) > self._MOVE_TOLERANCE):
+                logger.info(f"[HID] aim missed: wanted ({x},{y}) got ({fx},{fy})")
         except Exception:
-            cur_x, cur_y = 0, 0
-        dx = int(x - cur_x)
-        dy = int(y - cur_y)
-        if dx == 0 and dy == 0:
-            return True
-        self._send(f"MOVE,{dx},{dy}")
-        steps = max(abs(dx), abs(dy)) // 10 + 1
-        time.sleep(steps * 0.0002 + 0.02)
+            pass
         return True
 
     # ---- clicks --------------------------------------------------------------

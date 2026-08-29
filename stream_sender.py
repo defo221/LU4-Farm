@@ -83,7 +83,7 @@ DEFAULT_QUALITY = 60
 PACE_FRACTION = 0.8            # of the frame interval
 PACE_MAX_S = 0.05              # hard cap, so idle tiles stay responsive
 
-REMOTE_STEP_SIZE = 40          # px per HID report; 10 is far too slow for panning
+REMOTE_STEP_SIZE = 20          # px per HID report; 10 is too slow, 40 overshoots
 MOVE_TOLERANCE = 2             # px; closer than this counts as arrived
 MOVE_CORRECTIONS = 3           # extra MOVE passes allowed to close the gap
 
@@ -315,6 +315,7 @@ class HidLink:
             if abs(dx) <= MOVE_TOLERANCE and abs(dy) <= MOVE_TOLERANCE:
                 return True
             self._ask(f"MOVE,{dx},{dy}")   # blocks until firmware replies "OK"
+            time.sleep(0.008)              # allow last USB HID frame to reach the OS
         cx, cy = cursor_pos()
         if abs(int(x) - cx) > MOVE_TOLERANCE or abs(int(y) - cy) > MOVE_TOLERANCE:
             logger.warn(f"[HID] aim missed: wanted ({x},{y}) got ({cx},{cy})")
@@ -759,7 +760,7 @@ class Capturer:
 # ── one viewer connection ─────────────────────────────────────────────────────
 class Session:
     def __init__(self, chan, hid, name, warnings,
-                 viewer_manual=None, bot=None):
+                 viewer_manual=None, viewer_fps_lock=None, bot=None):
         self.chan = chan
         self.hid = hid
         self.name = name
@@ -769,7 +770,9 @@ class Session:
         self.stop = threading.Event()
         self.last_msg = time.time()
         # shared Event set while the viewer has this tile in focus; pauses the bot
-        self.viewer_manual = viewer_manual or threading.Event()
+        self.viewer_manual   = viewer_manual   or threading.Event()
+        # shared Event set while the tile is [MAX]-locked; pauses the bot independently
+        self.viewer_fps_lock = viewer_fps_lock or threading.Event()
         # FarmBot instance, or None when not running
         self._bot = bot
         self._build_ms = 0.0
@@ -808,6 +811,15 @@ class Session:
                 self.viewer_manual.clear()
             return
 
+        if t == "fps_lock":
+            # Viewer toggled the [MAX] fps-lock on this tile (middle-click).
+            # Pause / resume the bot independently of viewer manual focus.
+            if cmd.get("v"):
+                self.viewer_fps_lock.set()
+            else:
+                self.viewer_fps_lock.clear()
+            return
+
         if t == "camera_orient":
             # Viewer is broadcasting the first allowed camera orientation.
             # orient_2 = (orient_1 + 180) % 360 — computed by the bot.
@@ -821,6 +833,18 @@ class Session:
             n = int(cmd.get("n", 1))
             if self._bot is not None:
                 self._bot.set_ma_select(n)
+            return
+
+        if t == "hp_only":
+            # Viewer toggled HP-only mode (no ground clicks; HP monitoring + F2 still run).
+            if self._bot is not None:
+                self._bot.set_hp_only(bool(cmd.get("v", False)))
+            return
+
+        if t == "mob_hp_pct":
+            # Viewer updated the MOB_HP_HIGH_PCT threshold.
+            if self._bot is not None:
+                self._bot.set_mob_hp_pct(int(cmd.get("pct", 30)))
             return
 
         if not self.hid.connected:
@@ -997,8 +1021,9 @@ class Session:
             with self._outbox_cv:
                 self._outbox_cv.notify_all()
             self.cap.close()
-            # Viewer disconnected → release manual pause so the bot can resume.
+            # Viewer disconnected → release both pause sources so the bot can resume.
             self.viewer_manual.clear()
+            self.viewer_fps_lock.clear()
             # Whatever the viewer was holding, let go of it.
             self.hid.release_all()
             self.chan.close()
@@ -1050,12 +1075,13 @@ class Session:
 
 
 # ── bot integration ───────────────────────────────────────────────────────────
-def _launch_bot(hid: HidLink, viewer_manual: threading.Event):
+def _launch_bot(hid: HidLink, viewer_manual: threading.Event,
+                viewer_fps_lock: threading.Event):
     """Instantiate and start the FarmBot (bot.py) in a background thread.
 
     FarmBot receives an ArduinoHIDAdapter so it shares the sender's serial port,
-    and the viewer_manual Event so capslock.is_on() / raise_if_on() in the bot
-    automatically yield when the viewer has manual focus on this tile.
+    viewer_manual so the bot pauses when the viewer has manual focus on this tile,
+    and viewer_fps_lock so the bot pauses when the tile is [MAX]-locked.
     """
     try:
         from bot import FarmBot           # noqa: PLC0415  (same directory)
@@ -1064,7 +1090,8 @@ def _launch_bot(hid: HidLink, viewer_manual: threading.Event):
         return None
 
     adapter = ArduinoHIDAdapter(hid)
-    bot = FarmBot(shared_arduino=adapter, viewer_manual=viewer_manual)
+    bot = FarmBot(shared_arduino=adapter, viewer_manual=viewer_manual,
+                  viewer_fps_lock=viewer_fps_lock)
     t = threading.Thread(target=bot.run, daemon=True, name="bot-farmbot")
     t.start()
     logger.info("[BOT] FarmBot thread started")
@@ -1104,10 +1131,13 @@ def serve(name, port, arduino_port, run_bot=False):
             return False        # False → let Windows continue its default shutdown
         _ct.windll.kernel32.SetConsoleCtrlHandler(_ctrl_handler, True)
 
-    # One Event shared by every Session and the bot thread.  The Session sets
-    # it when the viewer takes manual focus; the bot blocks on it immediately.
-    viewer_manual = threading.Event()
-    bot = _launch_bot(hid, viewer_manual) if run_bot else None
+    # Events shared by every Session and the bot thread.
+    # viewer_manual  — set while the viewer has manual focus on this tile.
+    # viewer_fps_lock — set while the tile is [MAX]-locked (middle-click).
+    # Either event being set pauses the bot via capslock.is_on().
+    viewer_manual   = threading.Event()
+    viewer_fps_lock = threading.Event()
+    bot = _launch_bot(hid, viewer_manual, viewer_fps_lock) if run_bot else None
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1129,7 +1159,8 @@ def serve(name, port, arduino_port, run_bot=False):
                 current.chan.close()
             logger.info(f"[NET] viewer connected from {addr[0]}:{addr[1]}")
             current = Session(Channel(sock), hid, name, warnings,
-                              viewer_manual=viewer_manual, bot=bot)
+                              viewer_manual=viewer_manual,
+                              viewer_fps_lock=viewer_fps_lock, bot=bot)
             t = threading.Thread(target=current.run, daemon=True)
             t.start()
     except KeyboardInterrupt:

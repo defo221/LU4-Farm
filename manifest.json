@@ -16,8 +16,8 @@
     "size": 28672
   },
   "arduino_hid.py": {
-    "sha256": "78702967c52c743c2c6cc7e871cd89631333305a24c81f6dfd0b7d395b45f20b",
-    "size": 12735
+    "sha256": "31c3d71f80e2a118fa78b52038037787da0e4d5c230ddc9ab5def67e1d5c553b",
+    "size": 13617
   },
   "assets/asus/bag_mob_anchor.png": {
     "sha256": "258d7b4b4ec7e8357f4fe0b7828c333311204ba1d5c6e1be1069bb7e5b3f2440",
@@ -116,12 +116,12 @@
     "size": 599
   },
   "assets/fullhd/ma1.png": {
-    "sha256": "6655d12b563622aec055223f11b731500ed3e2e7ff22af30a317e4b6640226d3",
-    "size": 883
-  },
-  "assets/fullhd/ma2.png": {
     "sha256": "d23b2d38a4ae737a57356fb610fc5831895f7bf7e7577fb809a505b55bf9336d",
     "size": 999
+  },
+  "assets/fullhd/ma2.png": {
+    "sha256": "6655d12b563622aec055223f11b731500ed3e2e7ff22af30a317e4b6640226d3",
+    "size": 883
   },
   "assets/fullhd/ma_anchor.png": {
     "sha256": "720125375078ee9142ea5760b651463d0fabfd3e0d166f6d478a1e1691fc9a01",
@@ -131,9 +131,21 @@
     "sha256": "1acad251d7a946bb5dcc8709e7f2a898b8c364c351785642c4551984d66e5d56",
     "size": 4537
   },
+  "assets/fullhd/mob_skip1.png": {
+    "sha256": "dbdf756017e1bb3efd9b5d0b430e7a3332062e0342032166253c932c60d9c8bd",
+    "size": 673
+  },
   "assets/fullhd/party_pl_anchor.png": {
     "sha256": "7f2bb0d24215019077ecee79e04c5268751e263804d9e4288df7dd9ce459c407",
     "size": 519
+  },
+  "assets/fullhd/target_anchor.png": {
+    "sha256": "a975c65215d38499abf5ed98da3d912790e53878ba88b9388814264c32942647",
+    "size": 443
+  },
+  "assets/fullhd/target_check.png": {
+    "sha256": "bf532df7d110f736f73fc8dd2b6d283e82394d6f56506b7576dce35d9017e8d6",
+    "size": 721
   },
   "assets/fullhd_small/bag_mob_anchor.png": {
     "sha256": "1bfecb9d9b18404d17aeb1413a6410be660aa1afc57cd0a7b62a7b141014d750",
@@ -180,16 +192,16 @@
     "size": 7705
   },
   "bot.py": {
-    "sha256": "c8e7648606b1eefcd8df688c8e9707fcc05001fe91498af6bedf78089d3fa88f",
-    "size": 193194
+    "sha256": "f3ed3a12b1cf1b613c6fa8a7e69f0473a1a62b0b1d2b66e9b537f35f70e3eb35",
+    "size": 240932
   },
   "capslock.py": {
-    "sha256": "193fb40114fcd0f02df18456dc5d63002e415babca3aa38a44c6b32d759a8863",
-    "size": 3901
+    "sha256": "d1d8506977f966738248302ab4ad710ac0ee61322a6e7e7f8b89429b091a2396",
+    "size": 6225
   },
   "click_recorder.py": {
-    "sha256": "42ba650d068227321ba36fcbf41e6a3842681aaa5538ee7804a63f142ea63e34",
-    "size": 4669
+    "sha256": "85ed5ba06b9c0fbbd1aa722b718ccdb9b9ae39c1d9b70d758b2dc9b3af51ebb5",
+    "size": 4975
   },
   "debug_templates.py": {
     "sha256": "355f7d6f2225e9974660de66c27f242e8dc260ad83cf0465f91192f60c784130",
@@ -206,6 +218,10 @@
   "draw_corridors.py": {
     "sha256": "7a0eeed7425e81063437e099064b2516fa7d3cc94818f1373fa33a2c71256364",
     "size": 3748
+  },
+  "ERRORS.txt": {
+    "sha256": "297d7ce9fe54381cb3c743f0877949bb4cfc187705ab2ec8e3c17df249fcd40f",
+    "size": 538221
   },
   "fileserver.py": {
     "sha256": "c8959aef99b7d14c3a2b07715b33b1cd864fd50fadc592cfbfb790b65a83fbf2",
@@ -256,8 +272,8 @@
     "size": 71
   },
   "minimap_orient.py": {
-    "sha256": "0bcefb779fa836b8a3e681e51df52e09ac6a148094264df6dfe8d4c4e2372634",
-    "size": 16112
+    "sha256": "2b172e9013fd599fa756c387842594c1ee8716e1a0d2b7b6a3e82f8117a82621",
+    "size": 16711
   },
   "minimap_refs/arrow_12.png": {
     "sha256": "36d5490b63b05f318ec2f633c02ed0523ba1ae9e7ff8dc6c2f70feb684bb1044",
@@ -278,6 +294,14 @@
   "mouse.ino": {
     "sha256": "fcce6b917ffa8b9e2d7953d870456c839803dba324353c4da708c8e95b0fdc04",
     "size": 16635
+  },
+  "movement_dir.py": {
+    "sha256": "694763fef69417a094ad59527c0b84f8c21616f5d6abf9b5ae96fe6f51e24690",
+    "size": 29068
+  },
+  "movement_dir2.py": {
+    "sha256": "1b3d5e59cd62b8c2eb93c8075e5499e869b24f95890f614f90b43f6902f98fb5",
+    "size": 34590
   },
   "notifier.py": {
     "sha256": "ace95de2e7fa0392585a618a70e71d1876b72278ff9a72b26f47105a8798a816",
@@ -314,6 +338,14 @@
   "run_ma_calibration.bat": {
     "sha256": "405e35b76a97733e1c786e33a014f70a938fccb0c2c1a614666291f9e6eaee18",
     "size": 64
+  },
+  "run_movement_dir.bat": {
+    "sha256": "22897a890e627ebcefe612183245e2d86ab40a6c993f8b7905571ea96e65b374",
+    "size": 60
+  },
+  "run_movement_dir2.bat": {
+    "sha256": "c5f9f38bef2390895d8c98b6a337c6f43713aa843873ab812ff251f87f299ea0",
+    "size": 61
   },
   "run_recorder.bat": {
     "sha256": "c58720720f5761455974eff644cd04f6dfd484cd86e668eafbf0e9e17992c827",
@@ -356,12 +388,12 @@
     "size": 8230
   },
   "stream_sender.py": {
-    "sha256": "c648cac9f2f2994250d2c55ddadca0c865e474a34ac95e2acbc16e2444212192",
-    "size": 47521
+    "sha256": "a8f2a67f9d6bb9d53d8d449cbbe076ecd860e0d9162f9f57ea043b3246b01e77",
+    "size": 49006
   },
   "stream_viewer.py": {
-    "sha256": "058929f5c322751f0c7b1d0814c585ce460ea4519ff1be44f12dbb8b749bf9e8",
-    "size": 68514
+    "sha256": "4aa9e72ee31fe170dde4c6dbcdd5164c55aff6bbea61f715eae4479d46245db0",
+    "size": 74939
   },
   "Untitled": {
     "sha256": "0cd66359ace0a40e10df1403c760a295c164b95d48fcc78bdd9633e429c31b28",
@@ -380,9 +412,9 @@
     "size": 10555
   },
   "config.py": {
-    "sha256": "e795f6f1a5eeee68bd5d245b4d294e9d823f760517084bd1a96c6fb3aec8eaa9",
-    "shared_sha256": "5b27429179ba97677aaefeb9ae902c2fc813ad2c809805e5c45b4cda5f52b003",
-    "size": 21955,
+    "sha256": "a9ca11055bbb2e787dd3d36a31b217ee15a1ee7afcc72e1980789cc40bb1a426",
+    "shared_sha256": "76242ca14bb6a2a9041f031c43376594c37f45be65c60ee3632ce01ff42eda9d",
+    "size": 25558,
     "partial_update": true
   }
 }

@@ -241,6 +241,11 @@ class SlaveLink:
         self.want_fps = IDLE_FPS
         self.want_quality = JPEG_QUALITY_IDLE
 
+        # Optional callback invoked (with this link as argument) at the start of
+        # every successful connection so the viewer can replay persistent settings
+        # (camera orient, hp_only, mob_hp_pct …) to a freshly connected slave.
+        self.on_connect = None   # Callable[['SlaveLink'], None] | None
+
     # ---- lifecycle ----
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -280,6 +285,13 @@ class SlaveLink:
                 return
 
     def _pump(self, chan):
+        # Re-broadcast persistent viewer settings to the freshly connected slave.
+        if self.on_connect is not None:
+            try:
+                self.on_connect(self)
+            except Exception:
+                pass
+
         # Pinging on its own thread, because recv() below blocks: an idle tile
         # at 1 fps must still keep the slave's input watchdog fed.
         threading.Thread(target=self._pinger, args=(chan,), daemon=True).start()
@@ -474,6 +486,17 @@ class Viewer:
                                font=("Consolas", 9), padx=6)
         self.status.pack(side="left", fill="both", expand=True)
 
+        # ── HP-only mode toggle (right side of status bar) ───────────────────
+        _hp_fr = tk.Frame(_sb, bg="#1c1c1c")
+        _hp_fr.pack(side="right", padx=(0, 8))
+        self._hp_only: bool = False
+        self._hp_only_btn = tk.Button(
+            _hp_fr, text="LastHit Only", width=10, bd=0, relief="flat", cursor="hand2",
+            bg="#1a1a1a", fg="#555555", activebackground="#1a1a1a",
+            font=("Consolas", 9),
+            command=self._toggle_hp_only)
+        self._hp_only_btn.pack(side="left", ipady=1)
+
         # ── MA-anchor image selector (right side of status bar) ──────────────
         _ma_fr = tk.Frame(_sb, bg="#1c1c1c")
         _ma_fr.pack(side="right", padx=(0, 14))
@@ -492,6 +515,25 @@ class Viewer:
             font=("Consolas", 9),
             command=lambda: self._apply_ma_select(2))
         self._ma_btn2.pack(side="left", padx=(1, 0), ipady=1)
+
+        # ── MOB_HP_HIGH_PCT control (right side of status bar) ───────────────
+        _hp_co = tk.Frame(_sb, bg="#1c1c1c")
+        _hp_co.pack(side="right", padx=(0, 10))
+        tk.Label(_hp_co, text="HP%:", bg="#1c1c1c", fg="#666666",
+                 font=("Consolas", 9)).pack(side="left")
+        self._mob_hp_var = tk.StringVar(value="30")
+        _hp_ent = tk.Entry(_hp_co, textvariable=self._mob_hp_var, width=4,
+                           bg="#1a1a1a", fg="#ff8844", insertbackground="#ff8844",
+                           font=("Consolas", 9), bd=0,
+                           highlightthickness=1,
+                           highlightcolor="#ff8844",
+                           highlightbackground="#2a2a2a",
+                           relief="flat")
+        _hp_ent.pack(side="left", padx=(4, 0), ipady=1)
+        tk.Label(_hp_co, text="[Enter]", bg="#1c1c1c", fg="#444444",
+                 font=("Consolas", 8)).pack(side="left", padx=(4, 0))
+        _hp_ent.bind("<Return>",   lambda e: self._apply_mob_hp_pct())
+        _hp_ent.bind("<FocusOut>", lambda e: self.canvas.focus_set())
 
         # ── Camera orientation control (right side of status bar) ──────────────
         _co = tk.Frame(_sb, bg="#1c1c1c")
@@ -536,8 +578,39 @@ class Viewer:
 
         self._bind()
         for l in links:
+            l.on_connect = self._on_tile_connect
             l.start()
         self._tick()
+
+    # ---- MOB HP threshold control ----
+    def _apply_mob_hp_pct(self):
+        """Validate entry and broadcast new MOB_HP_HIGH_PCT to all bot instances."""
+        raw = (self._mob_hp_var.get() if self._mob_hp_var else "").strip()
+        try:
+            pct = max(1, min(100, int(raw)))
+        except ValueError:
+            self.canvas.focus_set()
+            return
+        self._mob_hp_var.set(str(pct))
+        msg = {"t": "mob_hp_pct", "pct": pct}
+        for t in self.tiles:
+            t.link.send(msg)
+        self.canvas.focus_set()
+
+    # ---- persistent-state replay on (re)connect ----
+    def _on_tile_connect(self, link) -> None:
+        """Re-broadcast all persistent viewer settings to a freshly connected slave.
+
+        Called from the SlaveLink background thread each time a TCP connection
+        is successfully established, so settings survive bot/sender restarts.
+        """
+        link.send({"t": "camera_orient", "deg": self._orient_1})
+        link.send({"t": "hp_only", "v": self._hp_only})
+        try:
+            pct = int(self._mob_hp_var.get())
+        except (ValueError, AttributeError):
+            pct = 30
+        link.send({"t": "mob_hp_pct", "pct": pct})
 
     # ---- camera orientation control ----
     def _apply_orient(self):
@@ -556,6 +629,20 @@ class Viewer:
         if self._orient2_var:
             self._orient2_var.set(str((deg + 180) % 360))
         msg = {"t": "camera_orient", "deg": deg}
+        for t in self.tiles:
+            t.link.send(msg)
+        self.canvas.focus_set()
+
+    def _toggle_hp_only(self) -> None:
+        """Toggle HP-only mode and broadcast to all bot instances."""
+        self._hp_only = not self._hp_only
+        if self._hp_only:
+            self._hp_only_btn.config(bg="#4a3800", fg="#ffcc00",
+                                     activebackground="#4a3800")
+        else:
+            self._hp_only_btn.config(bg="#1a1a1a", fg="#555555",
+                                     activebackground="#1a1a1a")
+        msg = {"t": "hp_only", "v": self._hp_only}
         for t in self.tiles:
             t.link.send(msg)
         self.canvas.focus_set()
@@ -594,8 +681,9 @@ class Viewer:
         # Tkinter dispatches them first and returns "break" before Windows' own
         # system-menu hook can consume the key.  This is the primary fix for
         # Alt+digit combos missing on the first attempt.
-        self.root.bind("<Alt_L>", self._on_alt_down)
-        self.root.bind("<Alt_R>", self._on_alt_down)
+        self.root.bind("<Alt_L>",    self._on_alt_down)
+        self.root.bind("<Alt_R>",    self._on_alt_down)
+        self.root.bind("<FocusOut>", self._on_focus_out)
         # CapsLock cannot be captured via Tkinter bindings on Windows — the OS
         # processes it as a modifier-state change before the event reaches the
         # app.  Instead a background thread polls the viewer PC's toggle state
@@ -1002,10 +1090,7 @@ class Viewer:
         online = sum(1 for t in self.tiles if t.link.status == "online")
         self.status.configure(
             text=f" active: {sel}   online: {online}/{len(self.tiles)}"
-                 f"   asking {self.active_fps:.0f}fps"
-                 f"   |  hover=select  click=action  right-drag=pan  wheel=scroll"
-                 f"   Ctrl+Tab=next  Ctrl+Shift+Tab=prev  Alt+1-0=pick"
-                 f"   Z=zoom  +/-=fps")
+                 f"   asking {self.active_fps:.0f}fps")
 
     # ---- hit testing ----
     def _tile_at(self, cx, cy):
@@ -1136,12 +1221,14 @@ class Viewer:
             t.link.send({"t": "mup", "btn": "left"})
 
     def _on_middle_down(self, event):
-        """Toggle per-tile max-FPS lock.  Never forwarded to the slave."""
+        """Toggle per-tile max-FPS lock and pause the slave bot while locked."""
         idx = self._tile_at(event.x, event.y)
         if idx is None:
             return "break"
         t = self.tiles[idx]
         t.fps_locked = not t.fps_locked
+        # Notify the slave so it pauses / resumes exactly like CapsLock.
+        t.link.send({"t": "fps_lock", "v": t.fps_locked})
         if t.fps_locked:
             t.link.set_active(True, self.active_fps)
         else:
@@ -1507,6 +1594,19 @@ class Viewer:
         if self.selected is not None:
             return self.tiles[self.selected].link
         return None
+
+    def _on_focus_out(self, event=None):
+        """Reset all keyboard state when the viewer window loses focus.
+
+        Alt+Tab (and any other focus-stealing action) causes the OS to swallow
+        the key-up events, leaving _alt_held=True and any held keys stuck.
+        Clearing everything here ensures a clean slate on return.
+        """
+        # Discard deferred Alt state — the key-up was never delivered.
+        self._alt_held  = False
+        self._alt_combo = False
+        # Release any physically-sent keys so the slave doesn't see them stuck.
+        self._release_keys(self._selected_link())
 
     def _release_keys(self, link):
         if link is None:

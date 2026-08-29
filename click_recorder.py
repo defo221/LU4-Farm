@@ -1,8 +1,8 @@
-"""click_recorder.py — record every LMB click at OS level.
+"""click_recorder.py — record every LMB and RMB click at OS level.
 
 Installs a low-level Windows mouse hook (WH_MOUSE_LL) that fires on every
-left-button-down event, regardless of whether the click came from a physical
-mouse, an Arduino HID device, or any other source.
+left- and right-button-down event, regardless of whether the click came from a
+physical mouse, an Arduino HID device, or any other source.
 
 Output goes to the console and is also appended to logs/click_record.log.
 Stop with CapsLock (toggles pause) or Ctrl+C.
@@ -16,8 +16,9 @@ import time
 import datetime
 
 # ── Win32 constants ────────────────────────────────────────────────────────────
-WH_MOUSE_LL   = 14
+WH_MOUSE_LL    = 14
 WM_LBUTTONDOWN = 0x0201
+WM_RBUTTONDOWN = 0x0204
 HC_ACTION      = 0
 
 user32   = ctypes.windll.user32
@@ -48,9 +49,10 @@ LOGS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 LOG_FILE  = os.path.join(LOGS_DIR, "click_record.log")
 
-_log_fh   = open(LOG_FILE, "a", encoding="utf-8")
-_count    = 0
-_paused   = False
+_log_fh    = open(LOG_FILE, "a", encoding="utf-8")
+_count_l   = 0
+_count_r   = 0
+_paused    = False
 
 def _write(line: str) -> None:
     print(line)
@@ -59,9 +61,9 @@ def _write(line: str) -> None:
 
 # ── Hook callback ──────────────────────────────────────────────────────────────
 def _hook_proc(nCode: int, wParam: int, lParam: int) -> int:
-    global _count, _paused
+    global _count_l, _count_r, _paused
 
-    if nCode == HC_ACTION and wParam == WM_LBUTTONDOWN:
+    if nCode == HC_ACTION and wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN):
         # Check CapsLock for pause toggle
         caps = user32.GetKeyState(0x14) & 0x0001
         if caps:
@@ -74,10 +76,14 @@ def _hook_proc(nCode: int, wParam: int, lParam: int) -> int:
                 _write(f"[{_ts()}] --- RESUMED ---")
 
         if not _paused:
-            info   = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            x, y   = info.pt.x, info.pt.y
-            _count += 1
-            _write(f"[{_ts()}] click #{_count:>4}  x={x:>5}  y={y:>5}")
+            info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            x, y = info.pt.x, info.pt.y
+            if wParam == WM_LBUTTONDOWN:
+                _count_l += 1
+                _write(f"[{_ts()}] LMB #{_count_l:>4}  x={x:>5}  y={y:>5}")
+            else:
+                _count_r += 1
+                _write(f"[{_ts()}] RMB #{_count_r:>4}  x={x:>5}  y={y:>5}")
 
     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
@@ -88,8 +94,8 @@ def _ts() -> str:
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     _write(f"[{_ts()}] click_recorder started — logging to {LOG_FILE}")
-    _write(f"[{_ts()}] {'TIME':12}  {'#':>5}  {'X':>5}  {'Y':>5}")
-    _write(f"[{_ts()}] {'-'*12}  {'-'*5}  {'-'*5}  {'-'*5}")
+    _write(f"[{_ts()}] {'TIME':12}  {'BTN':<5}  {'#':>5}  {'X':>5}  {'Y':>5}")
+    _write(f"[{_ts()}] {'-'*12}  {'-'*5}  {'-'*5}  {'-'*5}  {'-'*5}")
 
     callback   = HOOKPROC(_hook_proc)
     # WH_MOUSE_LL is a global hook that runs in the installing thread;
@@ -109,7 +115,7 @@ def main() -> None:
     finally:
         user32.UnhookWindowsHookEx(hook_id)
         _log_fh.close()
-        print(f"\n[{_ts()}] Stopped. {_count} clicks recorded → {LOG_FILE}")
+        print(f"\n[{_ts()}] Stopped. {_count_l} LMB + {_count_r} RMB recorded → {LOG_FILE}")
 
 
 if __name__ == "__main__":

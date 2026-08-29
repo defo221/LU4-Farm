@@ -296,6 +296,117 @@ def _sa_find_blue_dots(frame: np.ndarray,
     return _sa_nms(raw, nms_dist)
 
 
+def _sa_find_target_anchor(frame: np.ndarray,
+                           tmpl: Optional[np.ndarray],
+                           conf: float = 0.75,
+                           ) -> Optional[Tuple[int, int]]:
+    """Return the bottom-centre (cx, cy_bottom) of the best target_anchor match.
+
+    Single full-frame matchTemplate.  SA_EXCL_ROIS (FHD or ASUS) are applied
+    to mask UI regions.  BAG_MOB_ANCHOR_ROI is already covered by those
+    exclusions, so no separate bag-ROI mask is needed.
+    Returns None when the template is missing or no match exceeds *conf*.
+    """
+    if tmpl is None or frame is None:
+        return None
+    th, tw = tmpl.shape[:2]
+    fh, fw = frame.shape[:2]
+    if fh < th or fw < tw:
+        return None
+    hw, hh = tw // 2, th // 2
+    res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+
+    if fw == 1920 and fh == 1080:
+        excl: list = list(getattr(cfg, "SA_EXCL_ROIS_FHD", []))
+    elif fw == 1366 and fh == 768:
+        excl = list(getattr(cfg, "SA_EXCL_ROIS_ASUS", []))
+    else:
+        excl = []
+
+    if excl:
+        rh, rw = res.shape
+        for ex1, ey1, ex2, ey2 in excl:
+            rx1 = max(0, ex1 - hw);  rx2 = min(rw, ex2 - hw + 1)
+            ry1 = max(0, ey1 - hh);  ry2 = min(rh, ey2 - hh + 1)
+            if rx2 > rx1 and ry2 > ry1:
+                res[ry1:ry2, rx1:rx2] = -1.0
+    _, score, _, loc = cv2.minMaxLoc(res)
+    if score < conf:
+        return None
+    cx = loc[0] + hw
+    cy_bottom = loc[1] + th       # bottom edge of the matched template
+    logger.info(f"[TA] target_anchor: ({cx}, {cy_bottom})  score={score:.3f}")
+    return cx, cy_bottom
+
+
+def _tc_save_frame(frame: np.ndarray, tag: str) -> None:
+    """Save a full-screen frame to logs/tc_debug/ for failed target_check diagnosis."""
+    import os
+    import datetime
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "logs", "tc_debug")
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    path = os.path.join(out_dir, f"tc_fail_{ts}_{tag}.png")
+    try:
+        cv2.imwrite(path, frame)
+        logger.info(f"[TC] saved debug frame → {path}")
+    except Exception as e:
+        logger.warn(f"[TC] failed to save debug frame: {e}")
+
+
+def _sa_find_target_check(frame: np.ndarray,
+                          tmpl: Optional[np.ndarray],
+                          conf: float = 0.75,
+                          ) -> Optional[Tuple[int, int]]:
+    """Return the centre (cx, cy) of the best target_check match in the allowed area.
+
+    FHD: uses TC_EXCL_ROIS_FHD (smaller than SA_EXCL_ROIS_FHD — only UI chrome).
+    ASUS: uses SA_EXCL_ROIS_ASUS (no dedicated TC list yet).
+    BAG_MOB_ANCHOR_ROI is always appended so detections inside the target HP-bar
+    area are never returned.
+    Returns None when the template is missing or no match survives all exclusions.
+    """
+    if tmpl is None or frame is None:
+        return None
+    th, tw = tmpl.shape[:2]
+    fh, fw = frame.shape[:2]
+    if fh < th or fw < tw:
+        return None
+    hw, hh = tw // 2, th // 2
+    res = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
+
+    if fw == 1920 and fh == 1080:
+        excl: list = list(getattr(cfg, "TC_EXCL_ROIS_FHD", []))
+        bag = getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD_NEXTTARGET", None)
+    elif fw == 1366 and fh == 768:
+        excl = list(getattr(cfg, "SA_EXCL_ROIS_ASUS", []))
+        bag = getattr(cfg, "BAG_MOB_ANCHOR_ROI_ASUS", None)
+    else:
+        excl = []
+        bag  = None
+    if bag:
+        excl.append(bag)
+
+    if excl:
+        rh, rw = res.shape
+        for ex1, ey1, ex2, ey2 in excl:
+            rx1 = max(0, ex1 - hw);  rx2 = min(rw, ex2 - hw + 1)
+            ry1 = max(0, ey1 - hh);  ry2 = min(rh, ey2 - hh + 1)
+            if rx2 > rx1 and ry2 > ry1:
+                res[ry1:ry2, rx1:rx2] = -1.0
+
+    _, score, _, loc = cv2.minMaxLoc(res)
+    cx, cy = loc[0] + hw, loc[1] + hh
+    if score < conf:
+        logger.info(f"[TC] best candidate: ({cx}, {cy})  score={score:.3f}  "
+                    f"threshold={conf:.2f}  → NOT FOUND")
+        return None
+    logger.info(f"[TC] best candidate: ({cx}, {cy})  score={score:.3f}  "
+                f"threshold={conf:.2f}  → FOUND")
+    return cx, cy
+
+
 def _push_outside_excl(px: int, py: int,
                        rois: List[Tuple[int, int, int, int]],
                        ) -> Tuple[int, int]:
@@ -706,7 +817,7 @@ class WindowSlot:
     alive:          bool                      = True
     hwnd:           Optional[int]             = None
     # Per-window targeting mode — chosen interactively at startup.
-    targeting_mode:        str                       = "nexttarget"  # "nexttarget" | "assist"
+    targeting_mode:        str                       = "nexttarget"  # "nexttarget" | "assist" | "as" | "nc"
     # True  — "ac" mode: crosshair was calibrated at startup; assist_point is used
     #          for RMB clicks and the old phase-based approach (_single_assist_cycle_ac).
     # False — "a"  mode: ma1/ma2 images are used for targeting; no crosshair.
@@ -811,7 +922,8 @@ class TG:
 # ---------------------------------------------------------------------------
 
 class FarmBot:
-    def __init__(self, shared_arduino=None, viewer_manual=None):
+    def __init__(self, shared_arduino=None, viewer_manual=None,
+                 viewer_fps_lock=None):
         if shared_arduino is not None:
             # Shared instance provided by stream_sender — don't open/close it.
             self.hid = shared_arduino
@@ -823,6 +935,8 @@ class FarmBot:
 
         if viewer_manual is not None:
             capslock.register_viewer_manual(viewer_manual)
+        if viewer_fps_lock is not None:
+            capslock.register_viewer_fps_lock(viewer_fps_lock)
         self._notifier = Notifier(cfg.TG_TOKEN, cfg.TG_CHAT_ID)
         self.tg   = TG(self._notifier)
         self.sct  = _mss_mod.MSS()
@@ -864,17 +978,29 @@ class FarmBot:
             return fb
 
         _top = cfg.ANCHOR_TOP_REGION_PX   # mob/char anchors are only in the top N px
-        _mob_roi = (cfg.BAG_MOB_ANCHOR_ROI_FHD
-                    if cfg.RESOLUTION == "FHD"
-                       and getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None) is not None
-                    else None)
+        if cfg.RESOLUTION == "FHD" and getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None):
+            _mob_roi = cfg.BAG_MOB_ANCHOR_ROI_FHD
+        elif cfg.RESOLUTION == "ASUS" and getattr(cfg, "BAG_MOB_ANCHOR_ROI_ASUS", None):
+            _mob_roi = cfg.BAG_MOB_ANCHOR_ROI_ASUS
+        else:
+            _mob_roi = None
         self._mob_anchor   = AnchorFinder(_ap("bag_mob_anchor.png"),
                                           max_y=(_top if _mob_roi is None else None),
                                           roi=_mob_roi)
+        # Nexttarget-specific bag_mob_anchor finder with a tighter ROI
+        _mob_roi_n = None
+        if cfg.RESOLUTION == "FHD":
+            _mob_roi_n = getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD_NEXTTARGET", None)
+        self._mob_anchor_n = AnchorFinder(_ap("bag_mob_anchor.png"),
+                                          max_y=(_top if _mob_roi_n is None else None),
+                                          roi=_mob_roi_n)
         self._char_anchor  = AnchorFinder(_ap("char_bars_anchor.png"), max_y=_top)
         self._mob_dead_f   = AnchorFinder(_ap("mob_dead.png"),
                                           max_y=(_top if _mob_roi is None else None),
                                           roi=_mob_roi)
+        self._mob_dead_f_n = AnchorFinder(_ap("mob_dead.png"),
+                                          max_y=(_top if _mob_roi_n is None else None),
+                                          roi=_mob_roi_n)
         self._death_f      = AnchorFinder(_ap("death_screen.png"),    confidence=0.85)
         self._disconnect_f = AnchorFinder(_ap("disconnect.png"),      confidence=cfg.DC_CONFIDENCE)
         self._buff_f       = AnchorFinder(_ap("full_buff_check.png"),  confidence=0.85)
@@ -882,14 +1008,33 @@ class FarmBot:
         self._party_f      = AnchorFinder(_ap("party_pl_anchor.png"),
                                           confidence=cfg.PARTY_ANCHOR_CONFIDENCE)
 
-        # mob_skip: any file matching assets/mob_skip*.png triggers an extra F5
-        # (skip that target) immediately after bag_mob_anchor is detected.
+        # Determine mob_skip ROIs — same regions as bag_mob_anchor / mob_dead.
+        # Normal modes  : BAG_MOB_ANCHOR_ROI_FHD  / BAG_MOB_ANCHOR_ROI_ASUS
+        # NextTarget 'n': BAG_MOB_ANCHOR_ROI_FHD_NEXTTARGET (FHD only; ASUS
+        #                  has no separate nexttarget ROI, falls back to ASUS).
+        if cfg.RESOLUTION == "FHD":
+            _skip_roi        = getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None)
+            _skip_roi_n      = getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD_NEXTTARGET",
+                                       None) or _skip_roi
+        elif cfg.RESOLUTION == "ASUS":
+            _skip_roi        = getattr(cfg, "BAG_MOB_ANCHOR_ROI_ASUS", None)
+            _skip_roi_n      = _skip_roi   # no separate ASUS nexttarget ROI
+        else:
+            _skip_roi        = None
+            _skip_roi_n      = None
+
+        # mob_skip (post-confirmation): unnumbered assets/mob_skip*.png files
+        # trigger a skip action immediately AFTER bag_mob_anchor is confirmed.
         skip_paths = sorted(glob.glob(os.path.join(A, "mob_skip*.png")))
         self._mob_skip_finders: list[AnchorFinder] = [
-            AnchorFinder(p, max_y=cfg.ANCHOR_TOP_REGION_PX) for p in skip_paths
+            AnchorFinder(p, roi=_skip_roi) for p in skip_paths
+        ]
+        self._mob_skip_finders_n: list[AnchorFinder] = [
+            AnchorFinder(p, roi=_skip_roi_n) for p in skip_paths
         ]
         if self._mob_skip_finders:
             logger.info(f"[BOT] mob_skip: {len(self._mob_skip_finders)} image(s) loaded")
+
 
         # NC mode: mob name templates  (assets/mob_name*.png)
         # Each entry: (bgr_array, (height, width))
@@ -914,6 +1059,19 @@ class FarmBot:
 
         self._dot_red_tmpl:  Optional[np.ndarray] = _load_opt("in_target_red.png")
         self._dot_blue_tmpl: Optional[np.ndarray] = _load_opt("in_target_blue.png")
+
+        # target_check: validated after bag_mob_anchor in 'n' modes to confirm
+        # the selected mob is legal.  Searched OUTSIDE the bag ROI + SA_EXCL_ROIS.
+        _tc2 = _load_opt("target_check.png")
+        self._target_check_tmpl: Optional[np.ndarray] = _tc2
+
+        # target_anchor: single centred template that replaces in_target_blue/red
+        # for all approach-distance and corridor-target calculations.
+        # Detection returns bottom-centre; SA_APPROACH_FIXED_DOWN_OFFSET is then
+        # added to align with the effective ground-click reference point.
+        _ta = _load_opt("target_anchor.png")
+        self._target_anchor_tmpl: Optional[np.ndarray] = _ta
+        self._target_anchor_th:   int = (_ta.shape[0] if _ta is not None else 0)
 
         # Single-assist phase-3: healer fallback anchor (optional)
         _healer_path = _ap("healer_farm_anchor.png")
@@ -953,6 +1111,10 @@ class FarmBot:
         #   orient_2 = (self._camera_orient_1 + 180) % 360
         self._camera_orient_1: Optional[int] = None
         self._orient_bank = None   # lazy-loaded minimap template bank
+
+        # HP-only mode: skip all ground clicks and movement; only monitor mob HP
+        # and press F2 at low HP.  Toggled via the viewer's "HP Only" button.
+        self._hp_only: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1003,7 +1165,7 @@ class FarmBot:
             _alive = [s for s in self.slots.values() if s.enabled and s.alive]
             if (cfg.ASSIST_INDEPENDENT
                     and len(_alive) == 2
-                    and all(s.targeting_mode == "assist" for s in _alive)):
+                    and all(s.targeting_mode in ("assist", "as") for s in _alive)):
                 logger.info("[BOT] ASSIST_INDEPENDENT — entering split-assist loop")
                 while True:
                     try:
@@ -1011,6 +1173,7 @@ class FarmBot:
                     except capslock.CapsLockPause:
                         logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                         capslock.wait_off()
+                        self.hid.move_and_click(180, 30)
                         logger.info("[BOT] Resumed — continuing split-assist")
                         self._invalidate_all_caches()
                         continue
@@ -1020,11 +1183,13 @@ class FarmBot:
                     except capslock.CapsLockPause:
                         logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                         capslock.wait_off()
+                        self.hid.move_and_click(180, 30)
                         logger.info("[BOT] Resumed — continuing split-assist")
                         self._invalidate_all_caches()
                         continue  # restart the outer while loop, not fall to StopBot
                 raise StopBot
 
+            _prev_was_lasthit_cycle = False
             while True:
                 # --- pause-key check (outer loop so resume never re-opens HID) ---
                 try:
@@ -1032,9 +1197,24 @@ class FarmBot:
                 except capslock.CapsLockPause:
                     logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                     capslock.wait_off()
+                    self.hid.move_and_click(180, 30)
                     logger.info("[BOT] Resumed — continuing cycle")
                     self._invalidate_all_caches()
+                    _prev_was_lasthit_cycle = False
                     continue
+
+                # Detect LastHit-Only → normal transition.
+                # When _bypass is active, raise_if_on() is a no-op so the
+                # CapsLockPause handler above never fires.  Instead we track
+                # whether the previous _cycle() call was a LastHit-Only cycle
+                # and, when it no longer is (CapsLock released), emit the same
+                # self-select click that every other resume path performs.
+                _cur_is_lasthit = self._hp_only and capslock.is_on()
+                if _prev_was_lasthit_cycle and not _cur_is_lasthit:
+                    logger.info("[BOT] LastHit-Only released — self-select (180, 30)")
+                    self.hid.move_and_click(180, 30)
+                    self._invalidate_all_caches()
+                _prev_was_lasthit_cycle = _cur_is_lasthit
 
                 try:
                     result = self._cycle()
@@ -1051,8 +1231,10 @@ class FarmBot:
                 except capslock.CapsLockPause:
                     logger.info(f"[BOT] Paused via {cfg.PAUSE_KEY}")
                     capslock.wait_off()
+                    self.hid.move_and_click(180, 30)
                     logger.info("[BOT] Resumed — restarting from target search")
                     self._invalidate_all_caches()
+                    _prev_was_lasthit_cycle = False
                 except CycleTimeout as e:
                     logger.warn(f"[BOT] CycleTimeout: {e}")
                     consecutive_timeouts += 1
@@ -1128,6 +1310,9 @@ class FarmBot:
             if state[slot.title] == "search":
                 found = self._target_search()
                 if found:
+                    if 'n' in slot.targeting_mode:
+                        logger.info(f"[BOT] F8 in '{slot.title}' (n-mode pre-attack)")
+                        _press(self.hid, "f8")
                     self._press_attack()
                     if out_of_turn[slot.title]:
                         # Out-of-turn acquisition after mob_dead: skip buff/death
@@ -1147,8 +1332,10 @@ class FarmBot:
                         # Stay on this window for HP monitoring (don't switch yet)
                         continue
                 else:
-                    # 2 bursts exhausted — optionally check party anchor
-                    if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
+                    # 2 bursts exhausted — optionally check party anchor.
+                    # Skipped entirely for modes that contain 'n' (nexttarget, nc).
+                    if (cfg.ASSIST_REQUIRE_PARTY_ANCHOR
+                            and 'n' not in slot.targeting_mode):
                         frame = self._grab()
                         if (self._party_f.find(frame) is None
                                 and not self._recheck_party_anchor()):
@@ -1243,13 +1430,17 @@ class FarmBot:
     # ------------------------------------------------------------------
 
     def _cycle(self) -> str:
+        # LastHit-Only + CapsLock: skip all targeting/clicking, only monitor HP.
+        if self._hp_only and capslock.is_on():
+            return self._lastHit_only_cycle()
+
         # In mixed mode (one nexttarget + one assist), always open the cycle
         # with the nexttarget window.  If we start in the assist window it would
         # right-click the party bar while the nexttarget window still has no mob
         # selected — producing nothing for 15 s until the assist timeout fires.
         opp = self._opposite()
         if (opp is not None
-                and self._active.targeting_mode == "assist"
+                and self._active.targeting_mode in ("assist", "as")
                 and opp.targeting_mode in ("nexttarget", "nc")):
             logger.info(
                 f"[BOT] Reordering cycle: nexttarget window '{opp.title}' goes first"
@@ -1258,7 +1449,7 @@ class FarmBot:
 
         # ---- 1. Target search in current window ----
         opp = self._opposite()
-        if opp is None and self._active.targeting_mode == "assist":
+        if opp is None and self._active.targeting_mode in ("assist", "as"):
             # Single-window assist: phase-based targeting loop.
             # _single_assist_cycle() handles all RMB / F5 / healer / approach
             # logic and calls _press_attack() internally on success.
@@ -1268,7 +1459,8 @@ class FarmBot:
                     break
                 capslock.raise_if_on()
                 self._check_buff_and_death()
-                if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
+                if (cfg.ASSIST_REQUIRE_PARTY_ANCHOR
+                        and 'n' not in self._active.targeting_mode):
                     frame = self._grab()
                     if self._party_f.find(frame) is None and not self._recheck_party_anchor():
                         msg = (f"{self._active.nickname()}: party leader not detected"
@@ -1280,11 +1472,15 @@ class FarmBot:
         else:
             win1_targeted = self._target_search()
             if win1_targeted:
+                if 'n' in self._active.targeting_mode:
+                    logger.info(f"[BOT] F8 in '{self._active.title}' (n-mode pre-attack)")
+                    _press(self.hid, "f8")
                 self._press_attack()
-            elif self._active.targeting_mode == "assist":
+            elif self._active.targeting_mode in ("assist", "as"):
                 # Win1 assist gave up after 2 bursts — same check as win2
                 self._check_buff_and_death()
-                if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
+                if (cfg.ASSIST_REQUIRE_PARTY_ANCHOR
+                        and 'n' not in self._active.targeting_mode):
                     frame = self._grab()
                     if self._party_f.find(frame) is None and not self._recheck_party_anchor():
                         msg = (f"{self._active.nickname()}: party leader not detected"
@@ -1297,22 +1493,26 @@ class FarmBot:
         opp = self._opposite()
 
         both_assist = (opp is not None
-                       and self._active.targeting_mode == "assist"
-                       and opp.targeting_mode == "assist")
+                       and self._active.targeting_mode in ("assist", "as")
+                       and opp.targeting_mode in ("assist", "as"))
 
         if opp is not None:
             # ---- 2a. Switch, target search, attack in opposite window ----
             self._switch_to(opp)
             win2_targeted = self._target_search()
             if win2_targeted:
+                if 'n' in self._active.targeting_mode:
+                    logger.info(f"[BOT] F8 in '{self._active.title}' (n-mode pre-attack)")
+                    _press(self.hid, "f8")
                 self._press_attack()    # skips automatically for both-assist
 
             # ---- 3a. Check buffs/death in current (win2) ----
             self._check_buff_and_death()
 
             # If win2 assist targeting failed, optionally verify party leader is visible.
-            if not win2_targeted and self._active.targeting_mode == "assist":
-                if cfg.ASSIST_REQUIRE_PARTY_ANCHOR:
+            if not win2_targeted and self._active.targeting_mode in ("assist", "as"):
+                if (cfg.ASSIST_REQUIRE_PARTY_ANCHOR
+                        and 'n' not in self._active.targeting_mode):
                     frame = self._grab()
                     if self._party_f.find(frame) is None and not self._recheck_party_anchor():
                         msg = (f"{self._active.nickname()}: party leader not detected"
@@ -1340,10 +1540,9 @@ class FarmBot:
             hp_result = self._wait_low_hp()
             if hp_result == "ok":
                 break
-            if hp_result == "dead":
-                # Mob died before reaching kill zone (party leader finished early).
-                # Skip F2 + _wait_death and restart the whole cycle immediately.
-                logger.info("[BOT] Mob dead early — skipping finisher, restarting cycle")
+            if hp_result in ("dead", "lost"):
+                # Mob died early or anchor vanished — skip F2 and restart.
+                logger.info("[BOT] Mob dead/lost early — skipping finisher, restarting cycle")
                 return "ok"
             if hp_result == "timeout":
                 return "timeout"
@@ -1353,10 +1552,13 @@ class FarmBot:
             # For all other modes: use the legacy _target_search path.
             logger.info("[BOT] Stall — restarting target search")
             opp_stall = self._opposite()
-            if opp_stall is None and self._active.targeting_mode == "assist":
+            if opp_stall is None and self._active.targeting_mode in ("assist", "as"):
                 self._single_assist_cycle()
             else:
                 if self._target_search():
+                    if 'n' in self._active.targeting_mode:
+                        logger.info(f"[BOT] F8 in '{self._active.title}' (n-mode pre-attack)")
+                        _press(self.hid, "f8")
                     self._press_attack()
             # loop back to _wait_low_hp()
 
@@ -1371,12 +1573,12 @@ class FarmBot:
             _press(self.hid, "f2")
             logger.info(f"[BOT] F2 in '{self._active.title}' (both-assist finisher)")
 
-        # ---- 7. Wait for mob death ----
-        ok = self._wait_death()
-        if not ok:
-            return "timeout"
-
-        logger.info("[BOT] Mob dead — starting new cycle")
+        # ---- 7. Start next target search immediately ----
+        # _wait_death is skipped: as soon as the mob enters the kill zone and
+        # F2 is pressed, the next targeting cycle begins.  The mob dies from
+        # F2 / ongoing effects while the bot is already searching for the next
+        # target, eliminating the wait_death gap between kills.
+        logger.info("[BOT] Finisher pressed — starting next target search immediately")
         return "ok"
 
     # ------------------------------------------------------------------
@@ -1502,15 +1704,19 @@ class FarmBot:
                     f"\n[{slot.title}]  Targeting —"
                     f"  [n]  NextTarget (F5)"
                     f"  [nc] NameClick  (Shift+click mob name)"
-                    f"  [a]  Assist     (ma1/ma2 image anchor — no crosshair)"
+                    f"  [a]  Assist     (ma1/ma2 image anchor — corridor approach)"
+                    f"  [as] Assist     (ma1/ma2 image anchor — no ground clicks)"
                     f"  [ac] Assist+XH  (right-click crosshair — calibrated now): "
                 ).strip().lower()
-                if choice in ("a", "ac", "n", "nc"):
+                if choice in ("a", "as", "ac", "n", "nc"):
                     break
-                print("  Please type 'n', 'nc', 'a', or 'ac'.")
+                print("  Please type 'n', 'nc', 'a', 'as', or 'ac'.")
             if choice in ("a", "ac"):
                 slot.targeting_mode = "assist"
                 slot.assist_use_crosshair = (choice == "ac")
+            elif choice == "as":
+                slot.targeting_mode = "as"
+                slot.assist_use_crosshair = False
             elif choice == "nc":
                 slot.targeting_mode = "nc"
             else:
@@ -1518,7 +1724,7 @@ class FarmBot:
             logger.info(f"[BOT] '{slot.title}' targeting mode: {slot.targeting_mode}")
 
         # If both chose assist, ask party grouping
-        assist_slots = [s for s in enabled if s.targeting_mode == "assist"]
+        assist_slots = [s for s in enabled if s.targeting_mode in ("assist", "as")]
         ac_slots     = [s for s in assist_slots if s.assist_use_crosshair]
         if len(enabled) == 2 and len(assist_slots) == 2:
             print()
@@ -1625,7 +1831,15 @@ class FarmBot:
     def _target_search_nc(self) -> bool:
         """NC mode target search: Shift+click the nearest unoccupied mob name.
 
-        Loops until bag_mob_anchor is found or TARGET_NOT_FOUND_TIMEOUT expires.
+        When no valid mob-name templates are visible and camera orientation is
+        configured in the Viewer, rotates to the opposite configured angle and
+        searches again immediately after settling.  Each miss triggers another
+        rotation, alternating between the two configured angles until a target
+        is found or TARGET_NOT_FOUND_TIMEOUT expires.
+
+        When no camera orientation is configured, falls back to a brief
+        NC_WAIT_NO_MOB_MS sleep between retries (original behaviour).
+
         Returns True when a target is acquired; raises StopBot on timeout.
         """
         deadline = time.time() + cfg.TARGET_NOT_FOUND_TIMEOUT
@@ -1633,6 +1847,7 @@ class FarmBot:
 
         while True:
             capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
 
             frame = self._grab()
             fh, fw = frame.shape[:2]
@@ -1649,6 +1864,49 @@ class FarmBot:
                 nearest = min(valid,
                               key=lambda p: (p[0] - center_x) ** 2
                                           + (p[1] - center_y) ** 2)
+
+                # ── F5 fast-path: any valid name inside the centre zone ───────
+                half = cfg.NC_CENTER_F5_REGION_PX // 2
+                centre_names = [
+                    (cx, cy) for (cx, cy) in valid
+                    if abs(cx - center_x) <= half and abs(cy - center_y) <= half
+                ]
+                if centre_names:
+                    logger.info(
+                        f"[BOT] [nc] {len(centre_names)} name(s) in centre"
+                        f" {cfg.NC_CENTER_F5_REGION_PX}px zone — F5"
+                    )
+                    _press(self.hid, "f5")
+                    time.sleep(cfg.NC_F5_WAIT_MS / 1000.0)
+                    frame_f5 = self._grab()
+                    self._mob_anchor_n.invalidate()
+                    pos_f5 = self._mob_anchor_n.find(frame_f5)
+                    if pos_f5 is not None:
+                        logger.info(f"[BOT] [nc] bag_mob_anchor via F5 at {pos_f5}")
+                        if (self._cur_mob_skip_finders
+                                and any(f.find(frame_f5) is not None
+                                        for f in self._cur_mob_skip_finders)):
+                            logger.info("[BOT] [nc] mob_skip# (F5 path) — F5 to skip")
+                            _press(self.hid, "f5")
+                            time.sleep(_rhold() / 1000.0)
+                            self._mob_anchor_n.invalidate()
+                            continue
+                        self._mob_dead_f_n.invalidate()
+                        if self._mob_dead_f_n.find(frame_f5, silent=True) is not None:
+                            logger.info("[BOT] [nc] bag_mob_anchor + mob_dead (F5 path) — Esc, retrying")
+                            _press(self.hid, "esc")
+                            self._mob_anchor_n.invalidate()
+                            continue
+                        if not self._n_mode_validate_target_check():
+                            logger.info("[BOT] [nc] target_check failed (F5 path) — Esc, retrying")
+                            _press(self.hid, "esc")
+                            self._mob_anchor_n.invalidate()
+                            continue
+                        return True
+                    logger.info("[BOT] [nc] F5 missed — falling back to Shift+click")
+                    # fall through to Shift+click below
+
+                # ── Shift+click fallback (or no centre name) ─────────────────
                 click_x = nearest[0]
                 click_y = nearest[1] + cfg.NC_CLICK_BELOW_PX
                 logger.info(
@@ -1659,15 +1917,36 @@ class FarmBot:
                 time.sleep(cfg.NC_WAIT_AFTER_CLICK_MS / 1000.0)
 
                 frame2 = self._grab()
-                pos = self._mob_anchor.find(frame2)
+                pos = self._mob_anchor_n.find(frame2)
                 if pos is not None:
                     logger.info(f"[BOT] [nc] bag_mob_anchor found at {pos}")
+                    if (self._cur_mob_skip_finders
+                            and any(f.find(frame2) is not None
+                                    for f in self._cur_mob_skip_finders)):
+                        logger.info("[BOT] [nc] mob_skip# (Shift+click path) — F5 to skip")
+                        _press(self.hid, "f5")
+                        time.sleep(_rhold() / 1000.0)
+                        self._mob_anchor_n.invalidate()
+                        continue
+                    self._mob_dead_f_n.invalidate()
+                    if self._mob_dead_f_n.find(frame2, silent=True) is not None:
+                        logger.info("[BOT] [nc] bag_mob_anchor + mob_dead (click path) — Esc, retrying")
+                        _press(self.hid, "esc")
+                        self._mob_anchor_n.invalidate()
+                        continue
+                    if not self._n_mode_validate_target_check():
+                        logger.info("[BOT] [nc] target_check failed (Shift+click path) — Esc, retrying")
+                        _press(self.hid, "esc")
+                        self._mob_anchor_n.invalidate()
+                        continue
                     return True
                 # anchor not found after click — try again immediately
                 continue
 
-            # No valid names on screen — wait briefly and retry
-            logger.info(f"[BOT] [nc] no valid mob names on screen — waiting")
+            # No valid names on screen — wait before retrying.
+            # Camera rotation in 'n' mode is reserved exclusively for
+            # target_check validation after mob_anchor is confirmed.
+            logger.info("[BOT] [nc] no valid mob names — waiting")
             time.sleep(cfg.NC_WAIT_NO_MOB_MS / 1000.0)
 
             if time.time() > deadline:
@@ -1675,6 +1954,250 @@ class FarmBot:
                 logger.warn(f"[BOT] {msg}")
                 self.tg.send(msg)
                 raise StopBot
+
+    # ------------------------------------------------------------------
+    # Target validation helpers
+    # ------------------------------------------------------------------
+
+    def _n_mode_handle_mob_skip(self) -> bool:
+        """Handle mob_skip# detection in NextTarget mode after bag_mob_anchor confirmed.
+
+        Per cycle (up to 3):
+          • F5 → grab → if mob_skip# gone: validate (dead-mob guard + target_check) → True
+          • F5 again → grab → if mob_skip# gone: validate → True
+          • Both F5s still show mob_skip# → self-select (180, 30) + 3–5 s pause
+        On the 3rd failed cycle: F10 + attack + 1–3 s wait → return False.
+
+        Returns True  — valid target acquired (caller should return True to _cycle).
+        Returns False — restart the F5 targeting loop (caller should continue).
+        """
+        _ma = self._mob_anchor_n
+
+        for _cycle in range(1, 4):
+            for _attempt in range(1, 3):   # two F5 attempts per cycle
+                capslock.raise_if_on()
+                logger.info(
+                    f"[BOT] [n] mob_skip# cycle {_cycle} F5-{_attempt}: pressing F5"
+                )
+                _press(self.hid, "f5")
+                time.sleep(cfg.NC_F5_WAIT_MS / 1000.0)
+                frame = self._grab()
+                _ma.invalidate()
+
+                if _ma.find(frame) is None:
+                    logger.info(
+                        f"[BOT] [n] mob_skip# cycle {_cycle} F5-{_attempt}:"
+                        f" bag_mob_anchor gone — restarting F5 loop"
+                    )
+                    return False
+
+                if not (self._cur_mob_skip_finders
+                        and any(f.find(frame) is not None
+                                for f in self._cur_mob_skip_finders)):
+                    logger.info(
+                        f"[BOT] [n] mob_skip# cleared cycle {_cycle} F5-{_attempt}"
+                        f" — dead-mob guard + target_check"
+                    )
+                    self._mob_dead_f_n.invalidate()
+                    if self._mob_dead_f_n.find(frame, silent=True) is not None:
+                        logger.info(
+                            "[BOT] [n] mob_skip# cleared but mob_dead — Esc, restart"
+                        )
+                        _press(self.hid, "esc")
+                        _ma.invalidate()
+                        return False
+                    if not self._n_mode_validate_target_check():
+                        _ma.invalidate()
+                        return False
+                    return True
+
+                logger.info(
+                    f"[BOT] [n] mob_skip# still present cycle {_cycle} F5-{_attempt}"
+                )
+
+            # Both F5 attempts in this cycle found mob_skip#
+            if _cycle < 3:
+                logger.info(
+                    f"[BOT] [n] mob_skip# cycle {_cycle} exhausted"
+                    f" — self-select (180, 30) + pause"
+                )
+                self.hid.move_and_click(180, 30)
+                wait_s = random.uniform(1.0, 2.0)
+                logger.info(
+                    f"[BOT] [n] mob_skip# waiting {wait_s:.1f}s before cycle {_cycle + 1}"
+                )
+                capslock.interruptible_sleep(wait_s)
+            else:
+                logger.info("[BOT] [n] mob_skip# 3 cycles exhausted — F10 + attack")
+                _press(self.hid, "f10")
+                time.sleep(0.4)
+                self._press_attack()
+                wait_s = random.uniform(1.0, 3.0)
+                logger.info(
+                    f"[BOT] [n] mob_skip# F10 fallback: waiting {wait_s:.1f}s"
+                    f" — restarting target search"
+                )
+                capslock.interruptible_sleep(wait_s)
+                return False
+
+        return False   # unreachable, satisfies type checker
+
+    def _n_mode_validate_target_check(self) -> bool:
+        """Press F9 then verify that target_check is visible outside the bag ROI.
+
+        Called in 'n' modes after bag_mob_anchor is confirmed.  Sequence:
+          1. Press F9 and wait briefly for the UI to settle.
+          2. Grab a frame and search for target_check (SA_EXCL_ROIS + bag ROI
+             both excluded, so only the clear game-world area is accepted).
+          3. If found → return True (caller proceeds with F8 + attack).
+          4. If not found → rotate camera 180° and repeat the check once.
+          5. If still not found → self-select fallback (two rounds):
+               a. LMB (180, 30) → wait 3–5 s → F5 → bag_mob_anchor check
+                  → mob_dead guard → F9 → target_check; if found → return True.
+               b. If both rounds fail: F10 + attack → wait 1–3 s → return False
+                  so the caller's target-search loop restarts from scratch.
+
+        When target_check.png is absent from assets the check is skipped and
+        True is returned so existing behaviour is fully preserved.
+        """
+        if self._target_check_tmpl is None:
+            logger.warn("[BOT] [n] target_check.png not loaded — skipping check (allow)")
+            return True
+
+        _press(self.hid, "f9")
+        time.sleep(cfg.TARGET_CHECK_F9_WAIT_MS / 1000.0)
+        frame = self._grab()
+        pos = _sa_find_target_check(frame, self._target_check_tmpl,
+                                    conf=cfg.TC_CONFIDENCE)
+        if pos is not None:
+            logger.info(f"[BOT] [n] target_check found at {pos} — valid target")
+            return True
+
+        logger.info("[BOT] [n] target_check not found — rotating to opposite angle and rechecking")
+        if cfg.TC_DEBUG_SAVE:
+            _tc_save_frame(frame, "pre_rot")
+        self._rotate_camera_smart(nearest=False)
+        frame2 = self._grab()
+        pos2 = _sa_find_target_check(frame2, self._target_check_tmpl,
+                                     conf=cfg.TC_CONFIDENCE)
+        if pos2 is not None:
+            logger.info(f"[BOT] [n] target_check found at {pos2} after rotation — valid")
+            return True
+
+        if cfg.TC_DEBUG_SAVE:
+            _tc_save_frame(frame2, "post_rot")
+
+        # ── Fallback: both immediate and post-rotation checks failed ──────────
+        # Two rounds: LMB self-select → wait → F5 → bag_mob_anchor check →
+        # F9 → target_check.  Each round attempts a completely fresh target.
+        logger.info("[BOT] [n] target_check missing after rotation — self-select fallback")
+
+        for _round in range(1, 3):
+            capslock.raise_if_on()
+            logger.info(f"[BOT] [n] fallback round {_round}: LMB self-select at (180, 30) + F9")
+            self.hid.move_and_click(180, 30)
+            _press(self.hid, "f9")
+            _press(self.hid, "f9")
+            wait_s = random.uniform(1.0, 2.0)
+            logger.info(f"[BOT] [n] fallback round {_round}: "
+                        f"waiting {wait_s:.1f}s then pressing F5 for a fresh target")
+            capslock.interruptible_sleep(wait_s)
+            capslock.raise_if_on()
+
+            # Fresh F5 → bag_mob_anchor
+            logger.info(f"[BOT] [n] fallback round {_round}: F5 (new target)")
+            _press(self.hid, "f5")
+            time.sleep(cfg.NC_F5_WAIT_MS / 1000.0)
+            _fr = self._grab()
+            self._mob_anchor_n.invalidate()
+            if self._mob_anchor_n.find(_fr) is None:
+                logger.info(f"[BOT] [n] fallback round {_round}: "
+                            f"bag_mob_anchor not found after F5 — next round")
+                continue
+
+            # Dead-mob guard
+            self._mob_dead_f_n.invalidate()
+            if self._mob_dead_f_n.find(_fr, silent=True) is not None:
+                logger.info(f"[BOT] [n] fallback round {_round}: mob_dead — Esc, next round")
+                _press(self.hid, "esc")
+                self._mob_anchor_n.invalidate()
+                continue
+
+            # F9 → target_check (first attempt)
+            logger.info(f"[BOT] [n] fallback round {_round}: mob found — F9 + target_check")
+            _press(self.hid, "f9")
+            time.sleep(cfg.TARGET_CHECK_F9_WAIT_MS / 1000.0)
+            _fr2 = self._grab()
+            _pos = _sa_find_target_check(_fr2, self._target_check_tmpl,
+                                         conf=cfg.TC_CONFIDENCE)
+            if _pos is not None:
+                logger.info(f"[BOT] [n] target_check found at {_pos} "
+                            f"(fallback round {_round}) — valid target")
+                return True
+
+            # Not found — rotate 180° and recheck (mirrors the main flow)
+            logger.info(f"[BOT] [n] fallback round {_round}: "
+                        f"target_check not found — rotating to opposite angle")
+            self._rotate_camera_smart(nearest=False)
+            _fr3 = self._grab()
+            _pos2 = _sa_find_target_check(_fr3, self._target_check_tmpl,
+                                          conf=cfg.TC_CONFIDENCE)
+            if _pos2 is not None:
+                logger.info(f"[BOT] [n] target_check found at {_pos2} "
+                            f"after rotation (fallback round {_round}) — valid target")
+                return True
+
+            logger.info(f"[BOT] [n] fallback round {_round}: "
+                        f"target_check still not found after rotation — Esc, next round")
+            _press(self.hid, "esc")
+            self._mob_anchor_n.invalidate()
+
+        # Both rounds failed → F10 + attack, short wait, restart full targeting.
+        capslock.raise_if_on()
+        logger.info("[BOT] [n] target_check still missing — F10 + attack")
+        _press(self.hid, "f10")
+        time.sleep(0.4)
+        self._press_attack()
+
+        wait_s = random.uniform(1.0, 3.0)
+        logger.info(f"[BOT] [n] fallback: waiting {wait_s:.1f}s after F10 attack"
+                    f" — then restarting full target search")
+        capslock.interruptible_sleep(wait_s)
+
+        logger.info("[BOT] [n] fallback: restarting target search")
+        return False
+
+    def _find_target_anchor_in_bag_roi(self, frame: np.ndarray) -> bool:
+        """Return True if target_anchor is detected inside BAG_MOB_ANCHOR_ROI.
+
+        Used by assist mode to verify the newly selected mob is genuinely
+        targeted before starting the approach phase.  Returns True (allow) when
+        the template file is absent or no ROI is configured for this resolution.
+        """
+        tmpl = self._target_anchor_tmpl
+        if tmpl is None:
+            return True
+        fh, fw = frame.shape[:2]
+        if fw == 1920 and fh == 1080:
+            roi = getattr(cfg, "BAG_MOB_ANCHOR_ROI_FHD", None)
+        elif fw == 1366 and fh == 768:
+            roi = getattr(cfg, "BAG_MOB_ANCHOR_ROI_ASUS", None)
+        else:
+            roi = None
+        if roi is None:
+            return True
+        x1, y1, x2, y2 = roi
+        crop = frame[y1:y2, x1:x2]
+        th, tw = tmpl.shape[:2]
+        if crop.shape[0] < th or crop.shape[1] < tw:
+            logger.info("[BOT] target_anchor bag-ROI check: crop too small — not found")
+            return False
+        res = cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(res)
+        found = score >= cfg.TARGET_ANCHOR_CONFIDENCE
+        logger.info(f"[BOT] target_anchor in bag ROI: score={score:.3f}"
+                    f" ({'found' if found else 'not found'})")
+        return found
 
     # ------------------------------------------------------------------
     # Target search (dispatcher)
@@ -1926,6 +2449,31 @@ class FarmBot:
                     f"{self._camera_orient_1}deg / "
                     f"{(self._camera_orient_1 + 180) % 360}deg")
 
+    def set_mob_hp_pct(self, pct: int) -> None:
+        """Called by stream_sender when the viewer updates MOB_HP_HIGH_PCT.
+
+        Only takes effect when MOB_HP_HIGH_PCT_FROM_VIEWER = True in config.py.
+        """
+        if not cfg.MOB_HP_HIGH_PCT_FROM_VIEWER:
+            logger.info("[BOT] MOB_HP_HIGH_PCT_FROM_VIEWER is False — ignoring viewer HP%")
+            return
+        pct = max(1, min(100, int(pct)))
+        cfg.MOB_HP_HIGH_PCT = pct
+        logger.info(f"[BOT] MOB_HP_HIGH_PCT updated to {pct}%")
+
+    def set_hp_only(self, enabled: bool) -> None:
+        """Called by stream_sender when the viewer toggles LastHit-Only mode.
+
+        When True:
+          • The pause key (CapsLock / ScrollLock) is bypassed for this process,
+            so the bot keeps running even while other bots are fully paused.
+          • All ground clicks and character movement are suppressed.
+          • Mob targeting (RMB), HP monitoring, and F2 finisher continue as normal.
+        """
+        self._hp_only = bool(enabled)
+        capslock.set_bypass(self._hp_only)
+        logger.info(f"[BOT] LastHit-Only mode: {'ON — pause key bypassed' if self._hp_only else 'OFF'}")
+
     def _get_orient_bank(self):
         """Lazy-load and return the minimap template bank."""
         if self._orient_bank is None:
@@ -1934,7 +2482,8 @@ class FarmBot:
             logger.info("[BOT] Minimap orientation template bank built")
         return self._orient_bank
 
-    def _rotate_camera_smart(self, nearest: bool = False) -> None:
+    def _rotate_camera_smart(self, nearest: bool = False,
+                             max_iters: Optional[int] = None) -> None:
         """Align the camera to a configured orientation.
 
         When _camera_orient_1 is set (via viewer UI):
@@ -1945,6 +2494,10 @@ class FarmBot:
                nearest=True           — whichever of {orient_1, orient_2} is
                  nearest (fine-correct after a coarse blind drag).
           3. Iteratively drag + re-detect until within ±CAMERA_ORIENT_TOL_DEG.
+
+        max_iters overrides CAMERA_ORIENT_MAX_ITER when provided.  Pass 1 for
+        a single blind drag with no feedback loop (e.g. mid-targeting checks
+        where a fast coarse rotation is preferred over precise alignment).
 
         Falls back to the blind SA_CAMERA_ROTATE_DX drag if orientation is not
         configured or if arrow detection fails.
@@ -1962,7 +2515,7 @@ class FarmBot:
 
         def _detect() -> Optional[int]:
             try:
-                bgr     = _mo.grab_arrow_bgr(self.sct, _mo.ARROW_REGION)
+                bgr     = _mo.grab_arrow_bgr(self.sct, _mo._get_arrow_region(self.sct))
                 gray_up = _mo._upscale_gray(bgr)
                 ang, sc = _mo.match_angle(gray_up, bank)
                 logger.info(f"[BOT] SA: arrow={ang}deg score={sc:.3f}")
@@ -1988,7 +2541,8 @@ class FarmBot:
         logger.info(f"[BOT] SA: camera {cur}deg -> target {target}deg "
                     f"(orient1={orient_1}, orient2={orient_2}, nearest={nearest})")
 
-        for iteration in range(1, cfg.CAMERA_ORIENT_MAX_ITER + 1):
+        limit = max_iters if max_iters is not None else cfg.CAMERA_ORIENT_MAX_ITER
+        for iteration in range(1, limit + 1):
             delta = (target - cur + 180) % 360 - 180   # signed, (-180, +180]
             if abs(delta) <= cfg.CAMERA_ORIENT_TOL_DEG:
                 logger.info(f"[BOT] SA: camera aligned in {iteration - 1} step(s), "
@@ -2021,17 +2575,9 @@ class FarmBot:
         sc_x, sc_y = fw // 2, fh // 2
 
         def _dot_center_from(f: np.ndarray) -> Optional[Tuple[int, int]]:
-            """Detect in_target_blue OR in_target_red — both treated equally."""
-            dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
-                                      conf=cfg.NC_CONFIDENCE,
-                                      nms_dist=cfg.NC_NMS_DIST)
-            dots += _sa_find_blue_dots(f, self._dot_red_tmpl,
-                                       conf=cfg.NC_CONFIDENCE,
-                                       nms_dist=cfg.NC_NMS_DIST)
-            if len(dots) > 1:
-                dots.sort(key=lambda p: p[0])
-                dots = _sa_nms(dots, cfg.NC_NMS_DIST)
-            return _sa_blue_pair_center(dots)
+            """Detect target_anchor — returns bottom-centre of the best match."""
+            return _sa_find_target_anchor(f, self._target_anchor_tmpl,
+                                          conf=cfg.TARGET_ANCHOR_CONFIDENCE)
 
         # Step 1 — optional immediate attack depending on mode.
         # Pre-attack delay commented out — retained for other roles.
@@ -2058,18 +2604,18 @@ class FarmBot:
         pair_center = _dot_center_from(frame)
 
         if pair_center is None:
-            logger.info("[BOT] SA: in_target_blue/red not found — rotating camera")
+            logger.info("[BOT] SA: target_anchor not found — rotating camera")
             self._rotate_camera_smart()
             capslock.raise_if_on()
             frame = self._grab()
             pair_center = _dot_center_from(frame)
             if pair_center is None:
-                logger.info("[BOT] SA: in_target_blue/red still not found — normal attack")
+                logger.info("[BOT] SA: target_anchor still not found — normal attack")
                 self._press_attack()
                 return True
 
         dist = math.hypot(pair_center[0] - sc_x, pair_center[1] - sc_y)
-        logger.info(f"[BOT] SA: in_target_blue/red at {pair_center}, dist={dist:.0f}px")
+        logger.info(f"[BOT] SA: target_anchor at {pair_center}, dist={dist:.0f}px")
 
         if dist < cfg.SA_APPROACH_SKIP_PX:
             logger.info(f"[BOT] SA: already within SA_APPROACH_SKIP_PX"
@@ -2122,7 +2668,7 @@ class FarmBot:
 
                 pair_center = _dot_center_from(frame)
                 if pair_center is None:
-                    logger.info("[BOT] SA: in_target_blue/red lost before approach"
+                    logger.info("[BOT] SA: target_anchor lost before approach"
                                 f" click #{dclk_i + 1} — attacking")
                     break
 
@@ -2148,7 +2694,7 @@ class FarmBot:
             raw_len  = math.hypot(raw_dx, raw_dy) or 1.0
             h_factor = abs(raw_dx) / raw_len
             down_px  = int(h_factor * cfg.SA_APPROACH_DOWN_OFFSET_MAX)
-            eff_ty   = pair_center[1] + down_px
+            eff_ty   = pair_center[1] + cfg.SA_APPROACH_FIXED_DOWN_OFFSET + down_px
 
             click_pt = _sa_corridor_point(sc_x, sc_y,
                                           pair_center[0], eff_ty,
@@ -2306,17 +2852,12 @@ class FarmBot:
         sc_y = mon['height'] // 2
 
         def _wait_dot_dist(f: np.ndarray) -> Optional[float]:
-            """Distance from screen centre to the closest blue/red dot."""
-            dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
-                                      conf=cfg.NC_CONFIDENCE,
-                                      nms_dist=cfg.NC_NMS_DIST)
-            if not dots:
-                dots = _sa_find_blue_dots(f, self._dot_red_tmpl,
-                                          conf=cfg.NC_CONFIDENCE,
-                                          nms_dist=cfg.NC_NMS_DIST)
-            if not dots:
+            """Distance from screen centre to target_anchor bottom-centre."""
+            pt = _sa_find_target_anchor(f, self._target_anchor_tmpl,
+                                        conf=cfg.TARGET_ANCHOR_CONFIDENCE)
+            if pt is None:
                 return None
-            return math.hypot(dots[0][0] - sc_x, dots[0][1] - sc_y)
+            return math.hypot(pt[0] - sc_x, pt[1] - sc_y)
 
         fallback_done = False
         poll_n = 0
@@ -2549,16 +3090,9 @@ class FarmBot:
                 _cam_fine_needed = False
 
         def _dot_center(f: np.ndarray) -> Optional[Tuple[int, int]]:
-            # Short-circuit: search blue first; skip red when blue is found.
-            dots = _sa_find_blue_dots(f, self._dot_blue_tmpl,
-                                      conf=cfg.NC_CONFIDENCE,
-                                      nms_dist=cfg.NC_NMS_DIST)
-            if dots:
-                return dots[0]
-            dots = _sa_find_blue_dots(f, self._dot_red_tmpl,
-                                      conf=cfg.NC_CONFIDENCE,
-                                      nms_dist=cfg.NC_NMS_DIST)
-            return dots[0] if dots else None
+            """Return bottom-centre of target_anchor match."""
+            return _sa_find_target_anchor(f, self._target_anchor_tmpl,
+                                          conf=cfg.TARGET_ANCHOR_CONFIDENCE)
 
         def _dc(pt: Tuple[int, int]) -> float:
             return math.hypot(pt[0] - sc_x, pt[1] - sc_y)
@@ -2618,11 +3152,11 @@ class FarmBot:
                 mob_acquired = True
                 logger.info("[BOT] SA-MA: mob acquired after initial RMB")
             else:
-                logger.info("[BOT] SA-MA: bag_mob_anchor + mob_dead — Esc")
-                _press(self.hid, "esc")
+                logger.info("[BOT] SA-MA: bag_mob_anchor + mob_dead — self-select, retrying")
+                self.hid.move_and_click(180, 30)
         else:
-            logger.info("[BOT] SA-MA: mob_anchor not found after initial RMB — Esc")
-            _press(self.hid, "esc")
+            logger.info("[BOT] SA-MA: mob_anchor not found after initial RMB — self-select, retrying")
+            self.hid.move_and_click(180, 30)
 
         # ── Step 4: SKIP distance check — only after mob is confirmed ─────
         # blue/red dots are not a valid mob indicator until bag_mob_anchor
@@ -2631,7 +3165,7 @@ class FarmBot:
             pair_center = _dot_center(frame)
             if pair_center is not None:
                 dist_dots = _dc(pair_center)
-                logger.info(f"[BOT] SA-MA: blue/red at {pair_center}, dist={dist_dots:.0f}px")
+                logger.info(f"[BOT] SA-MA: target_anchor at {pair_center}, dist={dist_dots:.0f}px")
                 if dist_dots < cfg.SA_APPROACH_SKIP_PX:
                     logger.info("[BOT] SA-MA: within SA_APPROACH_SKIP_PX — attacking immediately")
                     self._press_attack()
@@ -2739,11 +3273,11 @@ class FarmBot:
                 if _used_poll_frame and _poll_dots_valid:
                     # Same frame the poll loop already searched — reuse result.
                     pair_center = _poll_dots
-                    logger.info("[PERF] blue/red dots match: reused (same frame)")
+                    logger.info("[PERF] target_anchor match: reused (same frame)")
                 else:
                     _t0 = time.perf_counter()
                     pair_center = _dot_center(frame)
-                    logger.info(f"[PERF] blue/red dots match:"
+                    logger.info(f"[PERF] target_anchor match:"
                                 f" {(time.perf_counter()-_t0)*1000:.0f} ms")
                 _dot_dist_val  = _dc(pair_center) if pair_center is not None else None
                 _dot_will_atk  = (_dot_dist_val is not None
@@ -2813,8 +3347,7 @@ class FarmBot:
                         _rmb_t = time.perf_counter()
                         if rmb_pt is not None:
                             _t0 = time.perf_counter()
-                            self.hid.move_and_right_click(
-                                rmb_pt[0], rmb_pt[1], wait_after=0)
+                            self.hid.move_and_right_click(rmb_pt[0], rmb_pt[1], wait_after=0)
                             logger.info(
                                 f"[PERF] RMB cmd: {(time.perf_counter()-_t0)*1000:.0f} ms")
                         _t0        = time.perf_counter()
@@ -2866,7 +3399,7 @@ class FarmBot:
                                     "[BOT] SA-MA: mob acquired in close-zone poll")
                                 _t0 = time.perf_counter()
                                 pair_center = _dot_center(frame)
-                                logger.info(f"[PERF] blue/red dots match (acq):"
+                                logger.info(f"[PERF] target_anchor match (acq):"
                                             f" {(time.perf_counter()-_t0)*1000:.0f} ms")
                                 # Cache so the next outer-loop iteration can reuse
                                 # without repeating the full-frame search.
@@ -2890,12 +3423,13 @@ class FarmBot:
                                     return True
                             else:
                                 logger.info("[BOT] SA-MA: close-zone:"
-                                            " bag_mob_anchor + mob_dead — Esc")
-                                _press(self.hid, "esc")
+                                            " bag_mob_anchor + mob_dead — self-select, retrying")
+                                self.hid.move_and_click(180, 30)
                         else:
                             logger.info(
-                                "[BOT] SA-MA: close-zone: mob_anchor not found — Esc")
-                            _press(self.hid, "esc")
+                                "[BOT] SA-MA: close-zone: mob_anchor not found"
+                                " — self-select, retrying")
+                            self.hid.move_and_click(180, 30)
                     else:
                         # mob_acquired was True — re-verify bag_mob_anchor is
                         # still present (it can be lost after camera rotations /
@@ -2907,7 +3441,7 @@ class FarmBot:
                                 # still targeted — check STOP
                                 _t0 = time.perf_counter()
                                 pair_center = _dot_center(frame)
-                                logger.info(f"[PERF] blue/red dots match:"
+                                logger.info(f"[PERF] target_anchor match:"
                                             f" {(time.perf_counter()-_t0)*1000:.0f} ms")
                                 # Cache for the next outer-loop pass, which reuses
                                 # this exact frame — otherwise its STOP check would
@@ -2932,13 +3466,13 @@ class FarmBot:
                                     return True
                             else:
                                 logger.info("[BOT] SA-MA: close-zone: acquired but"
-                                            " mob_dead — Esc, reset mob_acquired")
-                                _press(self.hid, "esc")
+                                            " mob_dead — self-select, reset mob_acquired")
+                                self.hid.move_and_click(180, 30)
                                 mob_acquired = False
                         else:
                             logger.info("[BOT] SA-MA: close-zone: bag_mob_anchor"
-                                        " lost (was acquired) — Esc, reset mob_acquired")
-                            _press(self.hid, "esc")
+                                        " lost (was acquired) — self-select, reset mob_acquired")
+                            self.hid.move_and_click(180, 30)
                             mob_acquired = False
 
                     # Reuse this frame and anchor in the next outer-loop iteration
@@ -3015,11 +3549,13 @@ class FarmBot:
                         mob_acquired = True
                         logger.info("[BOT] SA-MA: mob acquired after ground-click RMB")
                     else:
-                        logger.info("[BOT] SA-MA: bag_mob_anchor + mob_dead — Esc")
-                        _press(self.hid, "esc")
+                        logger.info("[BOT] SA-MA: bag_mob_anchor + mob_dead"
+                                    " — self-select, retrying")
+                        self.hid.move_and_click(180, 30)
                 else:
-                    logger.info("[BOT] SA-MA: mob_anchor not found after RMB — Esc")
-                    _press(self.hid, "esc")
+                    logger.info("[BOT] SA-MA: mob_anchor not found after RMB"
+                                " — self-select, retrying")
+                    self.hid.move_and_click(180, 30)
 
             # ── Poll loop: wait for lead trigger or timeout ────────────────
             # Assume anchor will stay valid; cleared inside poll on loss.
@@ -3066,7 +3602,7 @@ class FarmBot:
                 if mob_acquired:
                     _t0 = time.perf_counter()
                     pair_center = _dot_center(frame)
-                    logger.info(f"[PERF] blue/red dots match:"
+                    logger.info(f"[PERF] target_anchor match:"
                                 f" {(time.perf_counter()-_t0)*1000:.0f} ms")
                     # Cache for the outer loop — it reuses this exact frame.
                     _poll_dots, _poll_dots_valid = pair_center, True
@@ -3219,6 +3755,11 @@ class FarmBot:
         SA_EXCL_ROIS_FHD — applied to every corridor click (push 2 px past edge)
                            and to every blue/red dot detection (result-map mask).
         """
+        # ── LastHit-Only mode: skip everything — F2 only ─────────────────────
+        if self._hp_only and capslock.is_on():
+            logger.info("[BOT] SA-COR: LastHit-Only + pause key — skipping to HP monitor")
+            return True
+
         fw   = fh = sc_x = sc_y = 0
 
         def _rmb_pt() -> Optional[Tuple[int, int]]:
@@ -3232,16 +3773,9 @@ class FarmBot:
             sc_x, sc_y = fw // 2, fh // 2
 
         def _dot_center(f: np.ndarray) -> Optional[Tuple[int, int]]:
-            dots  = _sa_find_blue_dots(f, self._dot_blue_tmpl,
-                                       conf=cfg.NC_CONFIDENCE,
-                                       nms_dist=cfg.NC_NMS_DIST)
-            dots += _sa_find_blue_dots(f, self._dot_red_tmpl,
-                                       conf=cfg.NC_CONFIDENCE,
-                                       nms_dist=cfg.NC_NMS_DIST)
-            if len(dots) > 1:
-                dots.sort(key=lambda p: p[0])
-                dots = _sa_nms(dots, cfg.NC_NMS_DIST)
-            return _sa_blue_pair_center(dots)
+            """Return bottom-centre of target_anchor match."""
+            return _sa_find_target_anchor(f, self._target_anchor_tmpl,
+                                          conf=cfg.TARGET_ANCHOR_CONFIDENCE)
 
         def _dc(pt2: Tuple[int, int]) -> float:
             return math.hypot(pt2[0] - sc_x, pt2[1] - sc_y)
@@ -3255,6 +3789,7 @@ class FarmBot:
         rmb_n = 0
         while True:
             capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
             rmb_n += 1
             rmb = _rmb_pt()
             # Re-detect if set_ma_select() cleared the cache mid-loop.
@@ -3268,17 +3803,23 @@ class FarmBot:
                 logger.warn("[BOT] SA-COR: no RMB target — skipping RMB")
             capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
             capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
             frame = self._grab()
             self._mob_anchor.invalidate()
             if self._mob_anchor.find(frame) is not None:
                 self._mob_dead_f.invalidate()
                 if self._mob_dead_f.find(frame, silent=True) is None:
                     logger.info(f"[BOT] SA-COR: mob_anchor found (RMB #{rmb_n})")
+                    if not self._find_target_anchor_in_bag_roi(frame):
+                        logger.info("[BOT] SA-COR: target_anchor not in bag ROI"
+                                    " — self-select, retrying RMB")
+                        self.hid.move_and_click(180, 30)
+                        continue
                     break
-                logger.info("[BOT] SA-COR: mob_anchor + mob_dead — Esc")
+                logger.info("[BOT] SA-COR: mob_anchor + mob_dead — self-select, retrying")
             else:
-                logger.info("[BOT] SA-COR: mob_anchor not found — Esc")
-            _press(self.hid, "esc")
+                logger.info("[BOT] SA-COR: mob_anchor not found — self-select, retrying")
+            self.hid.move_and_click(180, 30)
 
         # ── Phase 2: Mob acquired ────────────────────────────────────────────
         if random.random() < cfg.SA_PRE_ATTACK_LONG_CHANCE:
@@ -3303,14 +3844,14 @@ class FarmBot:
 
         if pair_center is not None:
             d = _dc(pair_center)
-            logger.info(f"[BOT] SA-COR: blue/red at {pair_center}, dist={d:.0f}px")
+            logger.info(f"[BOT] SA-COR: target_anchor at {pair_center}, dist={d:.0f}px")
             if d < cfg.SA_APPROACH_SKIP_PX:
                 logger.info("[BOT] SA-COR: within SA_APPROACH_SKIP_PX"
                             " — attacking, no ground clicks")
                 self._press_attack()
                 return True
         else:
-            logger.info("[BOT] SA-COR: blue/red not visible after mob confirmed")
+            logger.info("[BOT] SA-COR: target_anchor not visible after mob confirmed")
 
         # ── Direction detection (0–SA_DIR_CHECKS_MAX checks) ────────────────
         n_dir = random.randint(0, cfg.SA_DIR_CHECKS_MAX)
@@ -3325,12 +3866,19 @@ class FarmBot:
             else:
                 logger.info(f"[BOT] SA-COR: dir {i+1}/{n_dir} → no signal")
 
-        # ── Corridor click approach ──────────────────────────────────────────
-        poll_s   = cfg.SA_APPROACH_POLL_MS / 1000.0
-        n_clicks = random.randint(cfg.SA_APPROACH_MIN_DCLK,
-                                  cfg.SA_APPROACH_MAX_DCLK)
-        logger.info(f"[BOT] SA-COR: approach budget = {n_clicks} click(s)")
-        reached = False
+        # ── Unlimited corridor click approach ────────────────────────────────
+        # Clicks continue until in_target_blue reaches SA_APPROACH_STOP_PX.
+        # Next-click timing is purely time-based:
+        #   wait_ms = max(0, d_click − SA_APPROACH_LEAD_PX) × SA_APPROACH_MS_PER_PX
+        # No visual reference (dots, ma_anchor) triggers the next click.
+        # Global timeout: SA_APPROACH_TIMEOUT_*_MS — if STOP_PX is not reached
+        # within this window, all ground clicks stop and attack fires immediately.
+        poll_s    = cfg.SA_APPROACH_POLL_MS / 1000.0
+        first_clk = True
+        clk_n     = 0
+        approach_timeout_ms = random.randint(cfg.SA_APPROACH_TIMEOUT_MIN_MS,
+                                             cfg.SA_APPROACH_TIMEOUT_MAX_MS)
+        approach_deadline   = time.perf_counter() + approach_timeout_ms / 1000.0
 
         excl: list = (list(getattr(cfg, "SA_EXCL_ROIS_FHD", []))
                       if fw == 1920 and fh == 1080 else [])
@@ -3346,12 +3894,11 @@ class FarmBot:
                 raw_len = math.hypot(raw_dx, raw_dy) or 1.0
                 h_fac   = abs(raw_dx) / raw_len
                 down_px = int(h_fac * cfg.SA_APPROACH_DOWN_OFFSET_MAX)
-                return dots[0], dots[1] + down_px
+                return dots[0], dots[1] + cfg.SA_APPROACH_FIXED_DOWN_OFFSET + down_px
             if dir_deg is not None:
-                rad  = math.radians(dir_deg)
+                rad   = math.radians(dir_deg)
                 tdist = max(cfg.SA_FIRST_CLICK_MIN_PX * 3,
                             int(min(fw, fh) * 0.35))
-                # SA_DIR_CORR_FRAC correction — same formula as movement_dir2.py
                 cx_ = cfg.SA_DIR_CORR_FRAC * (cfg.SA_CORRIDOR_W / 2) * math.cos(rad)
                 cy_ = (-cfg.SA_DIR_CORR_FRAC * (cfg.SA_CORRIDOR_W / 2)
                        * (math.sin(rad) ** 2))
@@ -3359,153 +3906,228 @@ class FarmBot:
                         int(sc_y - math.cos(rad) * tdist + cy_))
             return None
 
-        for dclk_i in range(n_clicks):
-            capslock.raise_if_on()
+        def _reacquire_and_attack(label: str) -> bool:
+            """RMB reacquire after mob_anchor loss, then attack.  Returns True."""
+            logger.info(f"[BOT] SA-COR: mob_anchor lost {label} — RMB reacquire + attack")
+            rmb = _rmb_pt()
+            if rmb is not None:
+                self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
+                capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            else:
+                logger.warn("[BOT] SA-COR: no RMB target for reacquire")
+            self._press_attack()
+            return True
 
-            if dclk_i > 0:
+        def _timeout_fallback(label: str) -> bool:
+            """Called when the global approach timeout fires.
+
+            Sequence:
+              1. RMB click at ma1/ma2 (or assist_point).
+              2. Wait SA_RMB_WAIT_MS.
+              3. Check bag_mob_anchor:
+                 - found (no mob_dead) → attack.
+                 - absent / mob_dead  → LMB clicks at the same ma1/ma2 position.
+            Returns True in both cases.
+            """
+            logger.info(f"[BOT] SA-COR: approach timeout {label}"
+                        f" ({approach_timeout_ms} ms) — RMB + mob_anchor check")
+            rmb = _rmb_pt()
+            if rmb is not None:
+                self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
+            else:
+                logger.warn("[BOT] SA-COR: timeout fallback — no RMB target")
+            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            capslock.raise_if_on()
+            tf = self._grab()
+            self._mob_anchor.invalidate()
+            anchor_found = self._mob_anchor.find(tf) is not None
+            dead_found   = False
+            if anchor_found:
+                self._mob_dead_f.invalidate()
+                dead_found = self._mob_dead_f.find(tf, silent=True) is not None
+            if anchor_found and not dead_found:
+                logger.info("[BOT] SA-COR: timeout fallback — mob_anchor present → attack")
+                self._press_attack()
+            else:
+                logger.info("[BOT] SA-COR: timeout fallback — mob_anchor absent → LMB at ma pos")
+                lmb_pt = _rmb_pt()
+                if lmb_pt is not None:
+                    n = random.randint(cfg.ASSIST_ATTACK_COUNT_MIN, cfg.ASSIST_ATTACK_COUNT_MAX)
+                    for i in range(n):
+                        self.hid.move_and_click(lmb_pt[0], lmb_pt[1])
+                        if i < n - 1:
+                            capslock.interruptible_sleep(random.uniform(
+                                cfg.ASSIST_ATTACK_INTERVAL_MIN_MS / 1000.0,
+                                cfg.ASSIST_ATTACK_INTERVAL_MAX_MS / 1000.0))
+                else:
+                    logger.warn("[BOT] SA-COR: timeout fallback — no LMB target either")
+            return True
+
+        while True:
+            capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
+
+            # Global approach timeout.
+            if time.perf_counter() >= approach_deadline:
+                return _timeout_fallback(f"before click #{clk_n + 1}")
+
+            # On the first click pair_center comes from Phase 2; re-grab on
+            # every subsequent click to get fresh mob_anchor + dot data.
+            if not first_clk:
                 frame = self._grab()
                 self._mob_anchor.invalidate()
                 if self._mob_anchor.find(frame) is None:
-                    logger.info(f"[BOT] SA-COR: mob_anchor lost at click"
-                                f" #{dclk_i+1} — RMB reacquire + attack")
-                    rmb = _rmb_pt()
-                    if rmb is not None:
-                        self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
-                        capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
-                    else:
-                        logger.warn("[BOT] SA-COR: no RMB target for reacquire")
-                    self._press_attack()
-                    return True
+                    return _reacquire_and_attack(f"before click #{clk_n + 1}")
                 pair_center = _dot_center(frame)
 
+            # Stop-distance check before firing the click.
             if pair_center is not None:
                 d = _dc(pair_center)
                 if d < cfg.SA_APPROACH_STOP_PX:
-                    logger.info(f"[BOT] SA-COR: within SA_APPROACH_STOP_PX before"
-                                f" click #{dclk_i+1} (dist={d:.0f}px)")
-                    reached = True
-                    break
+                    logger.info(
+                        f"[BOT] SA-COR: within SA_APPROACH_STOP_PX before"
+                        f" click #{clk_n + 1} (dist={d:.0f}px) — attacking")
+                    self._press_attack()
+                    return True
 
-            # If dots absent and no direction yet, take one measurement now.
+            # Direction measurement if no dots and no cached direction yet.
             if pair_center is None and direction is None:
                 logger.info(f"[BOT] SA-COR: no dots+no dir at click"
-                            f" #{dclk_i+1} — direction check")
+                            f" #{clk_n + 1} — direction check")
                 direction = self._detect_movement_dir()
 
             target = _make_target(pair_center, direction)
             if target is None:
-                logger.info(f"[BOT] SA-COR: no target at click #{dclk_i+1} — attacking")
+                logger.info(f"[BOT] SA-COR: no target at click #{clk_n + 1} — attacking")
                 self._press_attack()
                 return True
 
-            min_dist  = (cfg.SA_FIRST_CLICK_MIN_PX if dclk_i == 0
-                         else cfg.SA_NEXT_CLICK_MIN_PX)
+            min_dist = cfg.SA_FIRST_CLICK_MIN_PX if first_clk else cfg.SA_NEXT_CLICK_MIN_PX
+            first_clk = False
             click_pt  = _sa_corridor_point(sc_x, sc_y, target[0], target[1],
                                            cfg.SA_CORRIDOR_W // 2,
                                            min_dist_px=min_dist)
             if excl:
                 click_pt = _push_outside_excl(click_pt[0], click_pt[1], excl)
 
-            d_remaining = math.hypot(click_pt[0] - target[0],
-                                     click_pt[1] - target[1])
+            d_click = math.hypot(click_pt[0] - sc_x, click_pt[1] - sc_y)
+            clk_n  += 1
             logger.info(
-                f"[BOT] SA-COR: click #{dclk_i+1} at {click_pt},"
-                f" d_remaining={d_remaining:.0f}px"
+                f"[BOT] SA-COR: click #{clk_n} at {click_pt},"
+                f" d_click={d_click:.0f}px"
                 + (f", dir={direction:.1f}°"
-                   if pair_center is None and direction is not None else "")
-            )
+                   if pair_center is None and direction is not None else ""))
             self.hid.double_click_at(click_pt[0], click_pt[1])
 
-            # Poll until arrival or mob lost.
-            max_wait_ms    = random.randint(cfg.SA_APPROACH_MAX_WAIT_MIN_MS,
-                                            cfg.SA_APPROACH_MAX_WAIT_MAX_MS)
-            click_deadline = time.perf_counter() + max_wait_ms / 1000.0
+            # ── Wait: purely time-based, derived from click distance ─────────
+            # wait_ms = max(0, d_click - SA_APPROACH_LEAD_PX) * SA_APPROACH_MS_PER_PX
+            # Increasing SA_APPROACH_LEAD_PX shortens the wait (next click fires sooner).
+            # Increasing SA_APPROACH_MS_PER_PX lengthens the wait per effective pixel.
+            # No visual reference triggers the next click; only the timer matters.
+            wait_ms  = max(0.0,
+                           d_click - cfg.SA_APPROACH_LEAD_PX) * cfg.SA_APPROACH_MS_PER_PX
+            deadline = time.perf_counter() + wait_ms / 1000.0
+            logger.info(
+                f"[BOT] SA-COR: click #{clk_n} wait {wait_ms:.0f} ms"
+                f" (d_click={d_click:.0f} − LEAD={cfg.SA_APPROACH_LEAD_PX}"
+                f" × {cfg.SA_APPROACH_MS_PER_PX} ms/px)")
 
-            while time.perf_counter() < click_deadline:
+            while time.perf_counter() < deadline:
                 capslock.interruptible_sleep(poll_s)
                 capslock.raise_if_on()
+                capslock.raise_if_lasthit_paused(self._hp_only)
+
+                # Global timeout fires mid-poll too.
+                if time.perf_counter() >= approach_deadline:
+                    return _timeout_fallback(f"in poll after click #{clk_n}")
 
                 frame = self._grab()
                 self._mob_anchor.invalidate()
                 if self._mob_anchor.find(frame) is None:
-                    logger.info(f"[BOT] SA-COR: mob_anchor lost after click"
-                                f" #{dclk_i+1} — RMB + attack")
-                    rmb = _rmb_pt()
-                    if rmb is not None:
-                        self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
-                        capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
-                    else:
-                        logger.warn("[BOT] SA-COR: no RMB target for reacquire")
-                    self._press_attack()
-                    return True
+                    return _reacquire_and_attack(f"after click #{clk_n}")
 
                 pc = _dot_center(frame)
                 if pc is not None:
-                    d_now = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
+                    d_now = _dc(pc)
                     if d_now < cfg.SA_APPROACH_STOP_PX:
                         logger.info(
                             f"[BOT] SA-COR: within SA_APPROACH_STOP_PX after"
-                            f" click #{dclk_i+1} (dist={d_now:.0f}px)")
-                        reached      = True
-                        pair_center  = pc
-                        break
-                    if d_now <= d_remaining + cfg.SA_NEXT_CLICK_LEAD_PX:
-                        logger.info(
-                            f"[BOT] SA-COR: next-click trigger after"
-                            f" #{dclk_i+1} (d_now={d_now:.0f}"
-                            f" ≤ d_rem={d_remaining:.0f}"
-                            f" + lead={cfg.SA_NEXT_CLICK_LEAD_PX})")
-                        pair_center = pc
-                        break
+                            f" click #{clk_n} (dist={d_now:.0f}px) — attacking")
+                        self._press_attack()
+                        return True
+
+            pair_center = None  # fresh grab + dot check at top of next iteration
+
+            # ── Loop → fire next click ────────────────────────────────────────
+
+    def _single_assist_straight_cycle(self) -> bool:
+        """'as' (Assist Straight) — RMB targeting only, zero ground clicks.
+
+        Phase 1 — RMB loop at ma1/ma2 until both mob_anchor (not dead) and
+                  target_anchor inside BAG_MOB_ANCHOR_ROI are confirmed.
+                  mob_skip# is checked first on every grab.
+        Phase 2 — Pre-attack delay, then attack.  No movement whatsoever.
+        """
+        if self._hp_only and capslock.is_on():
+            logger.info("[BOT] SA-STR: LastHit-Only + pause key — skipping to HP monitor")
+            return True
+
+        frame = self._grab()
+
+        def _rmb_pt() -> Optional[Tuple[int, int]]:
+            return self._ma_pos or self._active.assist_point
+
+        if self._ma_pos is None:
+            self._ma_pos = self._detect_ma_pos(frame)
+
+        rmb_n = 0
+        while True:
+            capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
+            rmb_n += 1
+            rmb = _rmb_pt()
+            if rmb is None and self._ma_pos is None:
+                self._ma_pos = self._detect_ma_pos(frame)
+                rmb = _rmb_pt()
+            if rmb is not None:
+                logger.info(f"[BOT] SA-STR RMB #{rmb_n} at {rmb}")
+                self.hid.move_and_right_click(rmb[0], rmb[1], wait_after=0)
             else:
-                logger.info(f"[BOT] SA-COR: max wait reached after click"
-                            f" #{dclk_i+1} — proceeding")
-
-            if reached:
-                break
-
-        # ── Final fallback ───────────────────────────────────────────────────
-        if not reached:
-            frame    = self._grab()
-            pc_final = _dot_center(frame)
-            if pc_final is not None:
-                half  = cfg.SA_APPROACH_FINAL_AREA // 2
-                ex_hw = cfg.SA_APPROACH_FINAL_EXCL_W // 2
-                px, py = pc_final
-                for _ in range(60):
-                    fx = random.randint(px - half, px + half)
-                    fy = random.randint(py, py + cfg.SA_APPROACH_FINAL_AREA)
-                    if (abs(fx - px) <= ex_hw
-                            and fy <= py + cfg.SA_APPROACH_FINAL_EXCL_H):
+                logger.warn("[BOT] SA-STR: no RMB target — skipping RMB")
+            capslock.interruptible_sleep(cfg.SA_RMB_WAIT_MS / 1000.0)
+            capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
+            frame = self._grab()
+            self._mob_anchor.invalidate()
+            if self._mob_anchor.find(frame) is not None:
+                self._mob_dead_f.invalidate()
+                if self._mob_dead_f.find(frame, silent=True) is None:
+                    logger.info(f"[BOT] SA-STR: mob_anchor found (RMB #{rmb_n})")
+                    if not self._find_target_anchor_in_bag_roi(frame):
+                        logger.info("[BOT] SA-STR: target_anchor not in bag ROI"
+                                    " — self-select, retrying RMB")
+                        self.hid.move_and_click(180, 30)
                         continue
-                    if excl:
-                        fx, fy = _push_outside_excl(fx, fy, excl)
                     break
-                else:
-                    fx, fy = px, py + half
-                logger.info(f"[BOT] SA-COR: final fallback click at ({fx},{fy})")
-                self.hid.double_click_at(fx, fy)
-
-                wait_s         = random.uniform(
-                    cfg.SA_APPROACH_FINAL_WAIT_MIN_MS / 1000.0,
-                    cfg.SA_APPROACH_FINAL_WAIT_MAX_MS / 1000.0)
-                final_deadline = time.perf_counter() + wait_s
-                while time.perf_counter() < final_deadline:
-                    capslock.interruptible_sleep(poll_s)
-                    capslock.raise_if_on()
-                    frame = self._grab()
-                    pc = _dot_center(frame)
-                    if pc is not None:
-                        d = math.hypot(pc[0] - sc_x, pc[1] - sc_y)
-                        if d < cfg.SA_APPROACH_STOP_PX:
-                            logger.info("[BOT] SA-COR: within SA_APPROACH_STOP_PX"
-                                        " during final wait")
-                            break
-                else:
-                    logger.info("[BOT] SA-COR: final wait elapsed — attacking anyway")
+                logger.info("[BOT] SA-STR: mob_anchor + mob_dead — self-select, retrying")
             else:
-                logger.info("[BOT] SA-COR: dots lost before final fallback — attacking")
+                logger.info("[BOT] SA-STR: mob_anchor not found — self-select, retrying")
+            self.hid.move_and_click(180, 30)
 
+        # Phase 2 — pre-attack delay + attack, no ground clicks.
+        if random.random() < cfg.SA_PRE_ATTACK_LONG_CHANCE:
+            pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_LONG_MIN,
+                                       cfg.SA_PRE_ATTACK_DELAY_LONG_MAX)
+            logger.info(f"[BOT] SA-STR: long pre-attack delay {pre_delay:.2f}s")
+        else:
+            pre_delay = random.uniform(cfg.SA_PRE_ATTACK_DELAY_MIN,
+                                       cfg.SA_PRE_ATTACK_DELAY_MAX)
+            logger.info(f"[BOT] SA-STR: pre-attack delay {pre_delay:.2f}s")
+        if pre_delay > 0:
+            capslock.interruptible_sleep(pre_delay)
+        capslock.raise_if_on()
+
+        logger.info("[BOT] SA-STR: mob confirmed — attack")
         self._press_attack()
         return True
 
@@ -3514,11 +4136,15 @@ class FarmBot:
 
         "ac" mode (assist_use_crosshair=True):  classic phase-based loop with
             crosshair calibration → _single_assist_cycle_ac().
+        "as" mode                             : straight RMB only, no movement
+            → _single_assist_straight_cycle().
         "a"  mode (assist_use_crosshair=False): phaseCorrelate corridor approach
             → _sa_corridor_approach().
         """
         if self._active.assist_use_crosshair:
             return self._single_assist_cycle_ac()
+        if self._active.targeting_mode == "as":
+            return self._single_assist_straight_cycle()
         return self._sa_corridor_approach()
 
     def _single_assist_cycle_ac(self) -> bool:
@@ -3566,9 +4192,13 @@ class FarmBot:
                                 " -- dead target, not counting as live")
                 else:
                     logger.info("[BOT] SA: bag_mob_anchor found after RMB")
-                    return self._sa_phase4(frame)
+                    if not self._find_target_anchor_in_bag_roi(frame):
+                        logger.info("[BOT] SA phase-1: target_anchor not in bag ROI"
+                                    " — self-select, retrying RMB")
+                    else:
+                        return self._sa_phase4(frame)
             capslock.raise_if_on()
-            _press(self.hid, "esc")
+            self.hid.move_and_click(180, 30)
 
         # ---- Phase 2: ground-click fallback (runs once) -------------------------
         capslock.raise_if_on()
@@ -3623,6 +4253,7 @@ class FarmBot:
         rmb_n = 0
         while True:
             capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
             rmb_n += 1
             if pt is not None:
                 self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
@@ -3637,13 +4268,17 @@ class FarmBot:
                 self._mob_dead_f.invalidate()
                 if self._mob_dead_f.find(frame, silent=True) is not None:
                     logger.info("[BOT] SA recovery: bag_mob_anchor + mob_dead"
-                                " -- dead target, continuing loop")
-                    _press(self.hid, "esc")
+                                " -- dead target, self-select, continuing loop")
+                    self.hid.move_and_click(180, 30)
                     continue
                 logger.info("[BOT] SA: bag_mob_anchor found in recovery loop")
+                if not self._find_target_anchor_in_bag_roi(frame):
+                    logger.info("[BOT] SA recovery: target_anchor not in bag ROI"
+                                " — self-select, retrying RMB")
+                    self.hid.move_and_click(180, 30)
+                    continue
                 return self._sa_phase4(frame)
-            # mob_anchor not found -> clear any accidental selection
-            _press(self.hid, "esc")
+            self.hid.move_and_click(180, 30)
 
     def _target_search(self) -> bool:
         """Acquire a target then verify via bag_mob_anchor.
@@ -3658,21 +4293,30 @@ class FarmBot:
         assist:          returns False after max attempts (no Telegram, no stop).
         """
         self._mob_anchor.invalidate()
+        self._mob_anchor_n.invalidate()
         mode = self._active.targeting_mode
 
         if mode == "nc":
             return self._target_search_nc()
 
+        # Pick the correct AnchorFinder for this mode
+        _ma = self._mob_anchor_n if 'n' in mode else self._mob_anchor
+
         deadline  = time.time() + cfg.TARGET_NOT_FOUND_TIMEOUT
         attempts  = 0
+        f5_n      = 0   # nexttarget F5 counter (for logging only)
         logger.info(f"[BOT] Target search ({mode}) in '{self._active.title}'")
 
         while True:
             capslock.raise_if_on()
+            capslock.raise_if_lasthit_paused(self._hp_only)
 
             mode = self._active.targeting_mode   # re-read in case downgraded mid-loop
-            if mode == "assist":
-                pt = self._active.assist_point
+            if mode in ("assist", "as"):
+                # "as" uses ma_pos (image-detected) as the RMB point, with
+                # assist_point as the fallback (same as _single_assist_straight_cycle).
+                pt = (self._active.assist_point if mode == "assist"
+                      else (self._ma_pos or self._active.assist_point))
                 if pt is not None:
                     if attempts == 0:
                         capslock.interruptible_sleep(random.uniform(
@@ -3688,8 +4332,7 @@ class FarmBot:
                         cfg.ASSIST_RMB_COUNT_MIN, cfg.ASSIST_RMB_COUNT_MAX
                     )
                     for i in range(burst):
-                        self.hid.move_and_right_click(pt[0], pt[1],
-                                                      wait_after=0)
+                        self.hid.move_and_right_click(pt[0], pt[1], wait_after=0)
                         if i < burst - 1:
                             time.sleep(random.uniform(
                                 cfg.ASSIST_RMB_INTERVAL_MIN_MS / 1000.0,
@@ -3701,73 +4344,67 @@ class FarmBot:
                         cfg.ASSIST_RMB_INTERVAL_MAX_MS / 1000.0,
                     ))
                 else:
-                    logger.warn("[BOT] Assist point not calibrated — skipping right-click")
+                    logger.warn("[BOT] Assist/as RMB point not available — skipping right-click")
                     attempts += 1   # still counts as an attempt so we don't spin forever
             else:
+                f5_n += 1
+                logger.info(f"[BOT] F5 #{f5_n} in '{self._active.title}' (nexttarget)")
                 _press(self.hid, "f5")
-                time.sleep(_rhold() / 1000.0)
+                time.sleep(cfg.NC_F5_WAIT_MS / 1000.0)
 
             frame = self._grab()
-            pos   = self._mob_anchor.find(frame)
+
+            pos   = _ma.find(frame)
 
             if pos is not None:
-                # Check if this target should be skipped (nexttarget / nc mode)
-                if (self._active.targeting_mode != "assist"
-                        and self._mob_skip_finders
+                # NextTarget: mob_skip# after bag_mob_anchor — multi-cycle handler.
+                if ('n' in mode
+                        and self._cur_mob_skip_finders
                         and any(f.find(frame) is not None
-                                for f in self._mob_skip_finders)):
-                    logger.info("[BOT] mob_skip matched — pressing next target")
-                    _press(self.hid, "f5")
-                    time.sleep(_rhold() / 1000.0)
-                    self._mob_anchor.invalidate()
+                                for f in self._cur_mob_skip_finders)):
+                    logger.info("[BOT] [n] mob_skip# detected after bag_mob_anchor")
+                    if self._n_mode_handle_mob_skip():
+                        return True
+                    _ma.invalidate()
                     continue
 
-                # Assist mode mob_skip: LMB burst then Shift+RMB burst to re-assist.
-                # Counts as an attempt so ASSIST_RMB_MAX_ATTEMPTS still limits the loop.
-                if (self._active.targeting_mode == "assist"
-                        and self._mob_skip_finders
-                        and any(f.find(frame) is not None
-                                for f in self._mob_skip_finders)):
-                    pt = self._active.assist_point
-                    attempts += 1
-                    if pt is not None:
-                        logger.info(
-                            f"[BOT] mob_skip matched in assist mode"
-                            f" (attempt {attempts}/{cfg.ASSIST_RMB_MAX_ATTEMPTS})"
-                            f" — LMB burst + Shift+RMB burst to re-assist"
-                        )
-                        burst = random.randint(
-                            cfg.ASSIST_RMB_COUNT_MIN, cfg.ASSIST_RMB_COUNT_MAX
-                        )
-                        iv_lo = cfg.ASSIST_RMB_INTERVAL_MIN_MS / 1000.0
-                        iv_hi = cfg.ASSIST_RMB_INTERVAL_MAX_MS / 1000.0
-                        # LMB burst
-                        for i in range(burst):
-                            self.hid.move_and_click(pt[0], pt[1],
-                                                    hold_min=40, hold_max=80)
-                            if i < burst - 1:
-                                time.sleep(random.uniform(iv_lo, iv_hi))
-                        time.sleep(random.uniform(iv_lo, iv_hi))
-                        # Single Shift+RMB to re-assist
-                        self.hid.move_and_shift_right_click(pt[0], pt[1])
-                    if attempts >= cfg.ASSIST_RMB_MAX_ATTEMPTS:
-                        logger.info(
-                            f"[BOT] Assist mob_skip: gave up after"
-                            f" {attempts} attempts — returning to win1"
-                        )
-                        return False
-                    self._mob_anchor.invalidate()
-                    continue
+                # Assist / as mode: mob_skip# detection is intentionally ignored here.
+                # (handled only in _lastHit_only_cycle when CapsLock+LastHit are active)
 
                 logger.info(f"[BOT] bag_mob_anchor found at {pos}")
+
+                # 'n' modes: dead-mob guard — never enter F9/target_check for a dead mob.
+                if 'n' in mode:
+                    self._mob_dead_f_n.invalidate()
+                    if self._mob_dead_f_n.find(frame, silent=True) is not None:
+                        logger.info("[BOT] [n] bag_mob_anchor + mob_dead — Esc, retrying F5")
+                        _press(self.hid, "esc")
+                        _ma.invalidate()
+                        continue
+                    if not self._n_mode_validate_target_check():
+                        logger.info("[BOT] target_check validation failed — Esc, retrying")
+                        _press(self.hid, "esc")
+                        _ma.invalidate()
+                        continue
+
+                # Assist / as mode: verify target_anchor appears inside the bag ROI,
+                # confirming the mob is genuinely selected before approaching.
+                elif mode in ("assist", "as"):
+                    if not self._find_target_anchor_in_bag_roi(frame):
+                        logger.info("[BOT] target_anchor not in bag ROI — self-select, retrying RMB")
+                        self.hid.move_and_click(180, 30)
+                        attempts += 1   # counts toward ASSIST_RMB_MAX_ATTEMPTS
+                        _ma.invalidate()
+                        continue
+
                 return True
 
-            # RMB miss in assist mode: clear any accidental selection before retry.
-            if mode == "assist":
-                _press(self.hid, "esc")
+            # RMB miss in assist / as mode: self-select before retry.
+            if mode in ("assist", "as"):
+                self.hid.move_and_click(180, 30)
 
-            # Assist: give up after max attempts and return to win1
-            if mode == "assist" and attempts >= cfg.ASSIST_RMB_MAX_ATTEMPTS:
+            # Assist / as: give up after max attempts and return to win1
+            if mode in ("assist", "as") and attempts >= cfg.ASSIST_RMB_MAX_ATTEMPTS:
                 logger.info(
                     f"[BOT] Assist targeting gave up after {attempts} attempts"
                     f" in '{self._active.title}' — returning to win1"
@@ -3783,6 +4420,59 @@ class FarmBot:
     # ------------------------------------------------------------------
     # Buff / death check
     # ------------------------------------------------------------------
+
+    def _lastHit_only_cycle(self) -> str:
+        """Minimal cycle used when LastHit-Only toggle + CapsLock are both active.
+
+        Nothing is pressed or clicked except:
+          • F2 when the mob reaches MOB_HP_LOW_PCT – MOB_HP_HIGH_PCT.
+          • Internally: death_screen / disconnect check (camera rotation suppressed).
+
+        Everything else — targeting, camera rotation, RMB/LMB, F5/F8/F9, movement
+        — is completely skipped.
+        """
+        logger.info("[BOT] LastHit-Only cycle — HP monitoring only, all actions suppressed")
+
+        # death_screen + disconnect checks; camera rotation is suppressed inside
+        # _check_buff_and_death when hp_only + capslock.is_on().
+        self._check_buff_and_death()
+
+        # mob_skip# check: only in LastHit Only + CapsLock mode for assist modes.
+        # When the current target is a skip mob, perform 10 LMB clicks on ma1/ma2.
+        if (self._active is not None
+                and self._active.targeting_mode in ("assist", "as")
+                and self._cur_mob_skip_finders):
+            _lh_frame = self._grab()
+            if any(f.find(_lh_frame) is not None for f in self._cur_mob_skip_finders):
+                _pt = self._ma_pos or self._active.assist_point
+                if _pt is not None:
+                    logger.info(
+                        f"[BOT] LastHit-Only: mob_skip# detected"
+                        f" — 10 LMB clicks on {_pt}"
+                    )
+                    _iv_lo = cfg.ASSIST_RMB_INTERVAL_MIN_MS / 1000.0
+                    _iv_hi = cfg.ASSIST_RMB_INTERVAL_MAX_MS / 1000.0
+                    for _i in range(10):
+                        self.hid.move_and_click(_pt[0], _pt[1])
+                        if _i < 9:
+                            time.sleep(random.uniform(_iv_lo, _iv_hi))
+                else:
+                    logger.warn(
+                        "[BOT] LastHit-Only: mob_skip# detected but no ma1/ma2 target"
+                    )
+
+        hp_result = self._wait_low_hp()
+        if hp_result == "ok":
+            _press(self.hid, "f2")
+            logger.info(f"[BOT] F2 in '{self._active.title}' (LastHit-Only finisher)")
+            self._wait_death()
+        elif hp_result == "dead":
+            logger.info("[BOT] LastHit-Only: mob died before reaching kill zone")
+        elif hp_result == "lost":
+            logger.info("[BOT] LastHit-Only: bag_mob_anchor lost — no F2")
+        # "timeout" / "stalled": fall through — outer run() loop will retry
+
+        return "ok"
 
     def _check_buff_and_death(self) -> None:
         """
@@ -3801,7 +4491,7 @@ class FarmBot:
 
         # Cache ma1/ma2 RMB target — only search when not yet found (startup or after
         # viewer changes the selection, which clears self._ma_pos via set_ma_select).
-        if (self._active.targeting_mode == "assist"
+        if (self._active.targeting_mode in ("assist", "as")
                 and not self._active.assist_use_crosshair
                 and self._ma_pos is None):
             new_ma = self._detect_ma_pos(frame)
@@ -3826,6 +4516,16 @@ class FarmBot:
             logger.warn(f"[BOT] Death screen detected on '{nickname}'")
             self._on_death(self._active)
 
+        # Camera alignment — assist mode only, when an orient is configured.
+        # Rotates to the nearest of {orient_1, orient_2} unless already within
+        # CAMERA_ORIENT_TOL_DEG (in which case _rotate_camera_smart breaks
+        # immediately without issuing any drag).
+        # Suppressed in LastHit-Only + CapsLock mode (zero actions allowed).
+        if (self._active.targeting_mode in ("assist", "as")
+                and self._camera_orient_1 is not None
+                and not (self._hp_only and capslock.is_on())):
+            self._rotate_camera_smart(nearest=True)
+
     def _on_death(self, slot: WindowSlot) -> None:
         """Disable the dead slot. If none left, raise StopBot."""
         slot.alive = False
@@ -3837,6 +4537,7 @@ class FarmBot:
         # Switch to an alive window and reset anchor caches
         self._active = alive[0]
         self._mob_anchor.invalidate()
+        self._mob_anchor_n.invalidate()
         self._char_anchor.invalidate()
 
     def _may_switch_during_kill(self) -> bool:
@@ -3853,7 +4554,7 @@ class FarmBot:
         opp = self._opposite()
         if opp is None:
             return False
-        return (self._active.targeting_mode == "assist" and
+        return (self._active.targeting_mode in ("assist", "as") and
                 opp.targeting_mode == "nexttarget")
 
     # ------------------------------------------------------------------
@@ -3884,7 +4585,7 @@ class FarmBot:
             capslock.raise_if_on()
 
             frame     = self._grab()
-            mob_pos   = self._mob_anchor.find(frame, silent=True)
+            mob_pos   = self._cur_mob_anchor.find(frame, silent=True)
             mob_hp    = None
 
             if mob_pos:
@@ -3919,7 +4620,7 @@ class FarmBot:
 
             # Check mob_dead on every grab — skull and bag_mob_anchor coexist in the
             # same target frame so this fires even when mob_pos was found.
-            if self._mob_dead_f.find(frame, silent=True) is not None:
+            if self._cur_mob_dead_f.find(frame, silent=True) is not None:
                 logger.info("[BOT] mob_dead detected during HP wait — restarting cycle")
                 return "dead"
 
@@ -3930,10 +4631,10 @@ class FarmBot:
                         f"[BOT] bag_mob_anchor missing for {anchor_misses} consecutive"
                         f" checks — target lost, restarting cycle"
                     )
-                    return "ok"
+                    return "lost"
 
             # Stall check (nexttarget / nc): mob never took damage → switch target.
-            if (self._active.targeting_mode != "assist"
+            if (self._active.targeting_mode not in ("assist", "as")
                     and not hp_ever_dropped
                     and time.time() > stall_deadline):
                 jitter = random.uniform(cfg.HP_STALL_JITTER_MIN, cfg.HP_STALL_JITTER_MAX)
@@ -3944,10 +4645,10 @@ class FarmBot:
                 capslock.interruptible_sleep(jitter)
                 return "stalled"
 
-            # Stall check (assist): mob HP stuck at ≥ HP_STALL_PCT for HP_STALL_S seconds.
+            # Stall check (assist / as): mob HP stuck at ≥ HP_STALL_PCT for HP_STALL_S seconds.
             # Assist mode issues no LMB here under any condition — the stall is
             # resolved purely by returning "stalled" so _cycle restarts targeting.
-            if (self._active.targeting_mode == "assist"
+            if (self._active.targeting_mode in ("assist", "as")
                     and not hp_ever_dropped
                     and time.time() > stall_deadline):
                 nick = self._active.title
@@ -3964,7 +4665,7 @@ class FarmBot:
 
             # Full timeout
             if time.time() > deadline:
-                if self._active.targeting_mode == "assist":
+                if self._active.targeting_mode in ("assist", "as"):
                     logger.info("[BOT] HP wait timeout in assist mode — restarting cycle")
                     return "ok"
                 self._timeout_recovery("waited too long for mob HP to drop")
@@ -3995,7 +4696,7 @@ class FarmBot:
             capslock.raise_if_on()
 
             frame    = self._grab()
-            is_dead  = self._mob_dead_f.find(frame, silent=True) is not None
+            is_dead  = self._cur_mob_dead_f.find(frame, silent=True) is not None
 
             if is_dead:
                 logger.info("[BOT] mob_dead detected")
@@ -4003,7 +4704,7 @@ class FarmBot:
 
             # If the mob target indicator vanished (mob_dead never appeared but
             # bag_mob_anchor is gone too), treat it as dead and start a new cycle.
-            mob_pos = self._mob_anchor.find(frame, silent=True)
+            mob_pos = self._cur_mob_anchor.find(frame, silent=True)
             if mob_pos is None:
                 logger.info("[BOT] bag_mob_anchor gone without mob_dead — treating as dead")
                 return True
@@ -4025,7 +4726,7 @@ class FarmBot:
                 zero_hp_hits = 0
 
             if time.time() > deadline:
-                if self._active.targeting_mode == "assist":
+                if self._active.targeting_mode in ("assist", "as"):
                     logger.info("[BOT] Death wait timeout in assist mode — restarting cycle")
                     return True
                 self._timeout_recovery("waited too long for mob to die")
@@ -4063,7 +4764,8 @@ class FarmBot:
 
         if (char_mp is not None and mob_hp is not None
                 and char_mp > cfg.CHAR_MANA_HIGH_PCT
-                and mob_hp > 70.0):
+                and mob_hp > 70.0
+                and not (self._hp_only and capslock.is_on())):
             logger.info(f"[BOT] Mana {char_mp:.1f}% high, mob HP {mob_hp:.1f}% — F2")
             _press(self.hid, "f2")
 
@@ -4076,8 +4778,8 @@ class FarmBot:
         logger.warn(f"[BOT] Timeout: {reason} on '{nickname}'")
         self.tg.send(f"{nickname} {reason}.")
 
-        # In assist mode, downgrade to nexttarget so the next cycle uses F5.
-        if self._active.targeting_mode == "assist":
+        # In assist / as mode, downgrade to nexttarget so the next cycle uses F5.
+        if self._active.targeting_mode in ("assist", "as"):
             msg = f"{nickname}: assist mode disabled after timeout — switching to nexttarget (F5)."
             logger.warn(f"[BOT] {msg}")
             self.tg.send(msg)
@@ -4100,6 +4802,7 @@ class FarmBot:
 
         # Invalidate caches (will force full-screen re-search)
         self._mob_anchor.invalidate()
+        self._mob_anchor_n.invalidate()
         self._char_anchor.invalidate()
         self._party_f.invalidate()
 
@@ -4136,7 +4839,7 @@ class FarmBot:
         assist + opp assist        → F1 × N  (both-assist: F1 after RMB burst)
         assist + single window     → F1 × N  (no partner: F1 after RMB burst)
         """
-        if self._active.targeting_mode == "assist":
+        if self._active.targeting_mode in ("assist", "as"):
             opp = self._opposite()
             if opp is not None and opp.targeting_mode in ("nexttarget", "nc"):
                 # Opposite is the finisher — press F2
@@ -4238,8 +4941,10 @@ class FarmBot:
         self._active = slot
         # Invalidate anchor caches — anchor positions change per window
         self._mob_anchor.invalidate()
+        self._mob_anchor_n.invalidate()
         self._char_anchor.invalidate()
         self._mob_dead_f.invalidate()
+        self._mob_dead_f_n.invalidate()
         self._death_f.invalidate()
         self._disconnect_f.invalidate()
         self._buff_f.invalidate()
@@ -4254,9 +4959,41 @@ class FarmBot:
     # Helpers
     # ------------------------------------------------------------------
 
+    @property
+    def _cur_mob_anchor(self):
+        """Return the AnchorFinder that matches the active targeting mode.
+
+        'n' modes (nexttarget, nc) use the narrow right-side ROI so that
+        bag_mob_anchor is searched in the correct screen area.  All other
+        modes use the standard centre-top ROI.
+        """
+        mode = (self._active.targeting_mode if self._active is not None else "")
+        return self._mob_anchor_n if 'n' in mode else self._mob_anchor
+
+    @property
+    def _cur_mob_dead_f(self):
+        """Return the mob_dead AnchorFinder for the active targeting mode.
+
+        mob_dead appears at the same screen position as bag_mob_anchor, so it
+        must use the same ROI: the nexttarget-specific right-side region for
+        'n' modes, and the standard centre-top region for all other modes.
+        """
+        mode = (self._active.targeting_mode if self._active is not None else "")
+        return self._mob_dead_f_n if 'n' in mode else self._mob_dead_f
+
+    @property
+    def _cur_mob_skip_finders(self) -> list:
+        """Return the mob_skip (post-confirmation) finders for the active mode.
+
+        'n' modes use BAG_MOB_ANCHOR_ROI_FHD_NEXTTARGET; all other modes use
+        the standard BAG_MOB_ANCHOR_ROI for this resolution.
+        """
+        mode = (self._active.targeting_mode if self._active is not None else "")
+        return self._mob_skip_finders_n if 'n' in mode else self._mob_skip_finders
+
     def _invalidate_all_caches(self) -> None:
-        for finder in (self._mob_anchor, self._char_anchor,
-                       self._mob_dead_f, self._death_f,
+        for finder in (self._mob_anchor, self._mob_anchor_n, self._char_anchor,
+                       self._mob_dead_f, self._mob_dead_f_n, self._death_f,
                        self._buff_f, self._buff_f1, self._party_f):
             finder.invalidate()
 

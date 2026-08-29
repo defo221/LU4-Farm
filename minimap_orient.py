@@ -37,8 +37,21 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Minimap arrow region on a 1920x1080 screen
-ARROW_REGION = {"left": 1766, "top": 142, "width": 15, "height": 15}
+# Minimap arrow region per screen width.
+# Add new entries here when supporting additional resolutions.
+ARROW_REGIONS: dict[int, dict] = {
+    1920: {"left": 1766, "top": 142, "width": 15, "height": 15},  # FHD 1920×1080
+    1366: {"left": 1293, "top": 136, "width": 15, "height": 15},  # Asus 1366×768
+}
+# Default (FHD) kept for backward-compat with external callers that import it directly.
+ARROW_REGION = ARROW_REGIONS[1920]
+
+
+def _get_arrow_region(sct) -> dict:
+    """Return the ARROW_REGIONS entry whose key is closest to the primary monitor width."""
+    w = sct.monitors[1]["width"]
+    best = min(ARROW_REGIONS, key=lambda k: abs(k - w))
+    return ARROW_REGIONS[best]
 
 # Template matching
 UPSCALE   = 4   # 15 -> 60 px; improves rotation and matching precision
@@ -161,7 +174,7 @@ def grab_arrow_bgr(sct, region: dict) -> np.ndarray:
 
 def detect_once(bank: list, sct) -> tuple:
     """Single screen grab -> (angle_deg, score)."""
-    bgr     = grab_arrow_bgr(sct, ARROW_REGION)
+    bgr     = grab_arrow_bgr(sct, _get_arrow_region(sct))
     gray_up = _upscale_gray(bgr)
     return match_angle(gray_up, bank)
 
@@ -229,7 +242,7 @@ def run_live(bank: list) -> None:
     with mss.mss() as sct:
         while True:
             t0      = time.perf_counter()
-            bgr     = grab_arrow_bgr(sct, ARROW_REGION)
+            bgr     = grab_arrow_bgr(sct, _get_arrow_region(sct))
             gray_up = _upscale_gray(bgr)
             angle, score = match_angle(gray_up, bank)
             dt_ms   = (time.perf_counter() - t0) * 1000
